@@ -1,479 +1,475 @@
-+ xj-isa 共包含 33 条 scalar 指令，分别为 21 条整数计算指令、8条分支跳转指令、`LW`、`SW`、`FENCE` 和 `HALT`。不是完整的 RV32IMF 指令实现，但编码风格和整数语义采用 RV32IMF 的风格。
-+ xj-isa 共包含 36 条 vector 指令，分别为 11 条 INT32 算术和按位运算指令、7条BF16算术指令、4条格式转换指令、5条置换与规约指令、9条比较掩码与选择指令。均参考 RISC-V RVV扩展适当自定义。
-+ xj-isa 共包含 10 条 matrix 指令，为自定义的最小支持Matrix运算的指令集。
+# XJ-ISA 指令集规范
 
-
-# 1. Scalar ISA
-
-## 1.1. Scalar 硬件设计
-
-| 项目    | 定义                                                                        |
-| ----- | ------------------------------------------------------------------------- |
-| 指令长度  | 固定 32 bit；取指地址必须 4 B 对齐，`IALIGN=32`；不支持压缩指令                               |
-| 标量寄存器 | `x0–x31`，每个 32 bit；`x0` 恒为零、只读，无时序存储逻辑                                    |
-| 数据解释  | 无隐式类型标签；有符号值按 32-bit 二进制补码解释，无符号值按 UINT32 解释                              |
-| 目的寄存器 | `rd=x0` 仅禁止寄存器写入，不取消完成、访存、异常、控制转移或屏障效果                                    |
-| 算术边界  | 加减、PC 相对地址、链接值、有效地址计算都保留低 32 bit；溢出回绕，不饱和、不产生整数溢出异常                       |
-| 移位量   | 寄存器移位只取 `x[rs2][4:0]`；立即数移位取 `inst[24:20]`，均为 0–31                        |
-| 比较结果  | `SLT/SLTU/SLTI/SLTIU` 写入完整 32-bit 整数 `0` 或 `1`                            |
-| PC    | 下文的 `PC` 始终是本条指令地址，不是执行时正在取指的地址；普通顺序执行地址为 `PC+4`                          |
-| 字节顺序  | 小端：字的最低有效字节位于最低地址                                                         |
-| 指令空间  | ITCM 固定 256 KiB，字节地址 `[0x00000000, 0x00040000)`，最后合法取指地址 `0x0003FFFC`     |
-| 数据空间  | DTCM 固定 1 MiB，分为 4 个 256 KiB bank；核内 `LW/SW` 使用零基字节地址 `[0x00000000, 0x00100000)`，不把主机侧窗口基址加到核内地址上 |
-| 提交    | 架构寄存器只在按序提交时更新；执行完成与提交不同，`x0` 目的指令仍须完成其 ROB 记录                            |
-| 无结果指令 | 分支、`SW/FENCE/HALT` 及 `rd=x0` 指令不占用实际寄存器结果槽，但仍占用相应控制／队列记录                  |
-
-记号：`sext32(v)` 为将字段 `v` 的最高位符号扩展到 32 bit；`u32(v)` 为保留低 32 bit；`s32(v)` 为将 32-bit 位模式解释为有符号整数；`{a,b}` 为位拼接。汇编中寄存器名可写为 `x0–x31`，本文不要求特定 ABI；`x1` 没有硬连线链接寄存器身份。
-
-## 1.2. RISC-V opcode
-
-| 格式  | `inst[31:25]`         | `inst[24:20]`        | `inst[19:15]` | `inst[14:12]` | `inst[11:7]`         | `inst[6:0]` |
-| --- | --------------------- | -------------------- | ------------- | ------------- | -------------------- | ----------- |
-| R   | `funct7`              | `rs2`                | `rs1`         | `funct3`      | `rd`                 | `opcode`    |
-| I   | `imm[11:5]`           | `imm[4:0]`           | `rs1`         | `funct3`      | `rd`                 | `opcode`    |
-| S   | `imm[11:5]`           | `rs2`                | `rs1`         | `funct3`      | `imm[4:0]`           | `opcode`    |
-| B   | `{imm[12],imm[10:5]}` | `rs2`                | `rs1`         | `funct3`      | `{imm[4:1],imm[11]}` | `opcode`    |
-| U   | `imm[31:25]`          | `imm[24:20]`         | `imm[19:15]`  | `imm[14:12]`  | `rd`                 | `opcode`    |
-| J   | `{imm[20],imm[10:5]}` | `{imm[4:1],imm[11]}` | `imm[19:15]`  | `imm[14:12]`  | `rd`                 | `opcode`    |
-
-U/J 行的立即数字段不应被解释为源寄存器或功能码。以下所有 `opcode` 为十六进制，`funct3/funct7` 为二进制；`—` 表示该字段属于立即数或寄存器，不是额外固定限制。
-
-| 类别    | 32-bit 执行值／控制值                                          | 范围与单位                            |
-| ----- | ------------------------------------------------------- | -------------------------------- |
-| I     | `sext32(inst[31:20])`                                   | `-2048…2047`；访存和 JALR 为字节偏移      |
-| S     | `sext32({inst[31:25],inst[11:7]})`                      | `-2048…2047` 字节                  |
-| B     | `sext32({inst[31],inst[7],inst[30:25],inst[11:8],0})`   | `-4096…4094` 字节，步长 2             |
-| U     | `{inst[31:12],12'b0}`                                   | 低 12 bit 固定零；已经是执行值，不得再左移 12 bit |
-| J     | `sext32({inst[31],inst[19:12],inst[20],inst[30:21],0})` | `-1048576…1048574` 字节，步长 2       |
-| 移位立即数 | `shamt=inst[24:20]`，零扩展                                 | `0…31`；`inst[31:25]` 必须单独检查合法性   |
-B/J 的隐式低位零只保证 2 B 粒度，**不保证目标满足 4 B 对齐**。S/B/J 立即数必须按上述拼接，不能直接取 I 型字段。逻辑立即数与 `SLTIU` 的立即数也先符号扩展，不能按无符号 12-bit 数零扩展。
-
-
-## 1.3. 寄存器整数运算（10 条）
-
-全部使用 R 格式和 `opcode=0x33`，汇编操作数顺序为 `指令 rd, rs1, rs2`。下表的 `a=x[rs1]`、`b=x[rs2]`。
-
-|指令|形式|`funct3`|`funct7`|写入 `rd` 的值|
-|---|---|---|---|---|
-|`ADD`|`ADD rd, rs1, rs2`|`000`|`0000000`|`u32(a+b)`|
-|`SUB`|`SUB rd, rs1, rs2`|`000`|`0100000`|`u32(a-b)`，不是 `b-a`|
-|`AND`|`AND rd, rs1, rs2`|`111`|`0000000`|`a & b`|
-|`OR`|`OR rd, rs1, rs2`|`110`|`0000000`|按位或|
-|`XOR`|`XOR rd, rs1, rs2`|`100`|`0000000`|按位异或|
-|`SLL`|`SLL rd, rs1, rs2`|`001`|`0000000`|`u32(a << b[4:0])`，低位补零|
-|`SRL`|`SRL rd, rs1, rs2`|`101`|`0000000`|`a >> b[4:0]`，高位补零|
-|`SRA`|`SRA rd, rs1, rs2`|`101`|`0100000`|算术右移，高位补原符号位|
-|`SLT`|`SLT rd, rs1, rs2`|`010`|`0000000`|`s32(a)<s32(b) ? 1 : 0`|
-|`SLTU`|`SLTU rd, rs1, rs2`|`011`|`0000000`|`a<b ? 1 : 0`，无符号比较|
-
-仅 `SUB/SRA` 使用 `funct7=0100000`；不能只看 `funct3`，也不能只看 `inst[30]`。例如 `funct7=0000001` 的 M 扩展编码全部非法。
-
-## 1.4. 立即数与 PC 相对整数运算（11 条）
-
-#### 1.4.1. I 型整数运算（9 条）
-
-全部使用 `opcode=0x13`。普通立即数操作中 `a=x[rs1]`、`k=sext32(imm12)`。
-
-|指令|形式|`funct3`|`inst[31:25]` 限制|写入 `rd` 的值|
-|---|---|---|---|---|
-|`ADDI`|`ADDI rd, rs1, imm12`|`000`|—|`u32(a+k)`|
-|`ANDI`|`ANDI rd, rs1, imm12`|`111`|—|`a & k`|
-|`ORI`|`ORI rd, rs1, imm12`|`110`|—|`a` 与 `k` 按位或|
-|`XORI`|`XORI rd, rs1, imm12`|`100`|—|`a` 与 `k` 按位异或|
-|`SLLI`|`SLLI rd, rs1, shamt`|`001`|`0000000`|`u32(a << shamt)`|
-|`SRLI`|`SRLI rd, rs1, shamt`|`101`|`0000000`|逻辑右移 `shamt` bit|
-|`SRAI`|`SRAI rd, rs1, shamt`|`101`|`0100000`|算术右移 `shamt` bit|
-|`SLTI`|`SLTI rd, rs1, imm12`|`010`|—|`s32(a)<s32(k) ? 1 : 0`|
-|`SLTIU`|`SLTIU rd, rs1, imm12`|`011`|—|`a<k ? 1 : 0`，将符号扩展后的 `k` 按无符号值比较|
-
-`SLLI/SRLI/SRAI` 的其他上部编码非法；RV64 中可用的第六位移位量在本实现中不是合法 RV32 编码。移位量 0 不改变位模式，寄存器移位量 32 等效于 0；立即数形式不能编码 32。
-
-#### 1.4.2. U 型整数运算（2 条）
-
-| 指令      | 形式                | `opcode` | 语义                         |
-| ------- | ----------------- | -------- | -------------------------- |
-| `LUI`   | `LUI rd, imm20`   | `0x37`   | 写入 `{imm20,12'b0}`         |
-| `AUIPC` | `AUIPC rd, imm20` | `0x17`   | 写入 `u32(PC+{imm20,12'b0})` |
-
-`imm20` 是汇编中的高 20-bit 编码字段；低 12 bit 不写在操作数中。两条指令均不读取 `rs1/rs2`，即使相应指令位段恰好非零。
-
-```asm
-ADDI  x3, x0, -1       # x3 = 0xFFFFFFFF
-SLTIU x4, x0, -1       # x4 = 1；不是把立即数当作 0x00000FFF
-XORI  x5, x3, -1       # x5 = 0
-LUI   x6, 0x80000      # x6 = 0x80000000
-SRAI  x7, x6, 31       # x7 = 0xFFFFFFFF
-```
-
-
-#### 1.4.3. 标量访存（2 条）
-
-| 指令   | 形式                   | 格式  | `opcode` | `funct3` | 语义                                                                       |
-| ---- | -------------------- | --- | -------- | -------- | ------------------------------------------------------------------------ |
-| `LW` | `LW rd, imm12(rs1)`  | I   | `0x03`   | `010`    | `EA=u32(x[rs1]+sext32(imm12))`；读取 `EA…EA+3` 的 4 字节，小端组合成 32-bit 值写入 `rd` |
-| `SW` | `SW rs2, imm12(rs1)` | S   | `0x23`   | `010`    | 同样计算 `EA`，将已捕获的 `x[rs2][31:0]` 按小端写入 4 字节；无目的寄存器                         |
-
-| 边界                      | 行为                                    |
-| ----------------------- | ------------------------------------- |
-| `EA[1:0] != 0`          | 必须产生加载／存储未对齐故障，不拆分、不静默对齐、不做软件模拟       |
-| `EA` 不在完整 4 字节 DTCM 范围内 | 产生加载／存储访问故障，不截断地址后绕回 SRAM             |
-| 同时未对齐与越界                | 当前实现先报告未对齐                            |
-| `LW x0, ...`            | 必须实际访问并检查故障，仅丢弃寄存器写入                  |
-| `SW` 数据依赖未就绪            | 基址就绪可提前计算地址，但不能把地址就绪误当作存储完成           |
-| 访存顺序                    | MemQ 按派发顺序预留；仅队首可以实际访问，存储还必须处于 ROB 队首 |
-允许先完成 32-bit 地址加法再检查最终 `EA`，例如 `0xFFFFFFFF+1` 回绕到零；禁止的是在检查前截短到 SRAM 索引位数。`LB/LBU/LH/LHU/SB/SH` 均未实现。
-
-
-## 1.5. 分支与跳转（8 条）
-
-### 1.5.1. 条件分支（6 条）
-全部为 B 格式，`opcode=0x63`，无寄存器目的。`offset` 为第 2 节的 B 型字节偏移：条件成立时选择 `u32(PC+offset)`，否则选择 `u32(PC+4)`。
-
-|指令|形式|`funct3`|取分支条件|
-|---|---|---|---|
-|`BEQ`|`BEQ rs1, rs2, offset`|`000`|完整 32-bit 位模式相等|
-|`BNE`|`BNE rs1, rs2, offset`|`001`|完整 32-bit 位模式不等|
-|`BLT`|`BLT rs1, rs2, offset`|`100`|`s32(x[rs1]) < s32(x[rs2])`|
-|`BGE`|`BGE rs1, rs2, offset`|`101`|`s32(x[rs1]) >= s32(x[rs2])`|
-|`BLTU`|`BLTU rs1, rs2, offset`|`110`|无符号 `x[rs1] < x[rs2]`|
-|`BGEU`|`BGEU rs1, rs2, offset`|`111`|无符号 `x[rs1] >= x[rs2]`|
-
-`funct3=010/011` 非法。汇编器可接受标签，并据本条指令 PC 计算偏移；这里的 `offset` 明确表示字节数，不是编码字段的整数值。
-
-### 1.5.2. 无条件跳转（2 条）
-
-|指令|形式|格式／编码|所选下一地址|链接值|
-|---|---|---|---|---|
-|`JAL`|`JAL rd, offset`|J；`opcode=0x6F`|`u32(PC+offset)`|`u32(PC+4)`|
-|`JALR`|`JALR rd, imm12(rs1)`|I；`opcode=0x67, funct3=000`|`u32(old_x[rs1]+sext32(imm12)) & 0xFFFFFFFE`|`u32(PC+4)`|
-
-`JALR` 的立即数不乘 2。先捕获旧源操作数、再建立新目的版本，因此 **`rd=rs1` 合法**；不能先写链接值再用它计算目标。`JALR` 清除目标 bit 0 后仍须检查 bit 1。`rd=x0` 仍执行跳转与目标检查。
-
-### 1.5.3. 控制转移与异常边界
-
-1. 识别分支／跳转后按序分配 ROB 记录，阻塞后续派发并丢弃更年轻的预取响应；没有方向预测、目标预测或架构延迟槽。
-2. 等待更早工作提交，且源值就绪后，在 ROB 队首计算条件和目标。
-3. **只检查被选中的下一地址**：必须 4 B 对齐且小于 `0x40000`。未取分支的编码目标即使越界或未对齐，也不产生目标故障；但实际选择的 `PC+4` 仍须检查。
-4. 目标故障归属于当前控制转移指令，记录所选下一地址；不提交链接值。若同时未对齐与越界，先报告取指未对齐。
-5. 成功提交后从解析出的下一地址恢复取指。
-
-例如，`PC=0x100` 的 `BEQ x1,x2,+2` 在不相等时选择 `0x104`，合法；相等时选择 `0x102`，故障。`PC=0x3FFFC` 的不取分支仍会选择越界地址 `0x40000` 并故障。`JALR` 目标加法得到 `0x201` 时清 bit 0 后为 `0x200`，合法；得到 `0x203` 时变成 `0x202`，仍未对齐。
-
-**与标准的区别:** 标准 RV32I 将取分支／跳转的指令地址未对齐异常归于分支／跳转本身，但若目标取指发生 instruction access-fault 或 page-fault，则归于目标指令。XiangJiang 根据架构草案在控制转移阶段检查 ITCM 范围，越界也归于当前分支／跳转，并禁止其链接提交；不能将这个本地约定误称为标准访问故障归属规则。本实现不具有页表或 page-fault。
-
-## 1.6. 顺序屏障与终止（2 条）
-
-
-| 指令      | 形式                            | 合法编码                                                     | 作用                                            |
-| ------- | ----------------------------- | -------------------------------------------------------- | --------------------------------------------- |
-| `FENCE` | `FENCE pred, succ`            | `opcode=0x0F, funct3=000`                                | 保守全局内存屏障：等待更早指令提交及更早访存／事务完成，提交后继续 `PC+4`      |
-| `HALT`  | `HALT`（可用 `.word 0x0000000B`） | **仅完整机器字 `0x0000000B`**；`opcode=0x0B`（RISC-V `custom-0`） | 阻塞后续派发，等待更早提交、活跃访存、功能单元／结果缓冲及事务排空；提交后正常终止本次运行 |
-FENCE 编码字段为 `fm=inst[31:28]`、`pred=inst[27:24]`、`succ=inst[23:20]`、`rs1=inst[19:15]`、`rd=inst[11:7]`。`pred/succ` 四位分别为 I/O/R/W（bit 3/2/1/0）。本实现接受所有这些字段值，包括非零保留 `fm/rs1/rd`，忽略其操作数依赖与目的写入，统一执行完整屏障；排序可强于指定集合，不能更弱。标准允许基础实现保守处理保留 FENCE 配置。`FENCE.TSO`／`PAUSE` 若编码落在此类，也按完整屏障处理，不另计助记符，不提供额外性能语义。
-
-`FENCE` 不是 ALU 空操作，不进行缓存维护，不支持 `FENCE.I`（其 `funct3=001`）。当前标量-only 配置没有向量、矩阵或 DMA 引擎；全局屏障覆盖所有当前实际存在的内存工作，不声称存在那些引擎。
-
-`HALT` 是本项目的非标准扩展，使用 RISC-V 保留给自定义扩展的 `custom-0` opcode 空间；本实现只接受完整机器字 `0x0000000B`，其他 `custom-0` 编码均为非法指令。全零字仍按标准作为非法指令处理。`HALT` 不是 `ECALL/EBREAK/WFI`，也不是复位。普通终止及后续启动保留已提交寄存器值；复位时寄存器清零，TCM 内容不被架构性清零。预取到 HALT 编码不能立刻结束运行；未进入有效指令流或已被取消的 HALT 不产生终止效果。
-
-## 1.7. 非法指令与故障
-
-| 类别         | 行为                                                    |
-| ---------- | ----------------------------------------------------- |
-| 不在本文列表中的编码 | 作为非法指令进入 ROB，记录原机器字，不允许变成默认 ADD 或无操作                  |
-| 必须检查的字段    | 完整 7-bit opcode、各指令要求的 funct3、R 型及移位立即数所要求的完整上部 7 bit |
-| 非法指令目的     | 不创建寄存器写入，不读取伪造的源依赖；异常阻止更年轻指令提交                        |
-| 取指本身失败     | 取指故障优先于返回机器字的译码结果，包括全零或其他非法字                          |
-| 执行故障       | 按标签记录并可靠缓冲；不能因结果总线忙而丢失故障                              |
-| 故障停机       | 保留更早已提交状态，丢弃更年轻未提交状态；已有内存响应排空后再清内部记录                  |
-本地故障码是软件可见的实现约定，**不是 privileged RISC-V `mcause`**：
-
-|码|名称|附带地址／数据|
-|---|---|---|
-|0|无故障|0|
-|1|非法指令|原始 32-bit 机器字|
-|2|取指／所选控制目标未对齐|故障地址|
-|3|取指／所选控制目标越界|故障地址|
-|4|加载未对齐|有效地址|
-|5|加载访问故障|有效地址|
-|6|存储未对齐|有效地址|
-|7|存储访问故障|有效地址|
-
-未实现的类别包括：字节／半字访存、M 乘除、A 原子、C 压缩、浮点、向量／矩阵／DMA 指令、Zicsr、Zifencei、特权模式及 `ECALL/EBREAK/WFI/MRET` 等系统指令。标准 HINT 若其机器字本来属于本文已支持的整数编码，则按相应整数指令执行（例如 `ADDI x0,x0,0`）；不能把所有未知编码泛化为 HINT。
-
-## 1.8. 常用伪指令与边界示例
-
-这些是汇编展开，不增加独立机器指令：
-
-|常用写法|展开|注意|
-|---|---|---|
-|`NOP`|`ADDI x0, x0, 0`，机器字 `0x00000013`|与 HALT 编码不同|
-|`MV rd, rs`|`ADDI rd, rs, 0`|捕获旧源版本|
-|`NOT rd, rs`|`XORI rd, rs, -1`|立即数扩展到 `0xFFFFFFFF`|
-|`NEG rd, rs`|`SUB rd, x0, rs`|`0x80000000` 取负仍为自身|
-|`J offset`|`JAL x0, offset`|仍检查目标|
-|`JR rs`|`JALR x0, 0(rs)`|清目标 bit 0|
-|`RET`|`JALR x0, 0(x1)`|仅软件约定|
-
-ALU 接受已捕获的源位模式，不能在执行时重新读取架构寄存器。ALU 与分支单元均以一项寄存完成缓冲承接结果，响应被阻塞时保持全部数据／标签／异常稳定；上一响应被消费的同周期可接收下一请求。无目的写入的指令仍产生完成事件，避免 ROB 永久等待。此处说明实现接口约束，不承诺整体程序每周期提交一条分支。
-
-
-# 2. Vector ISA
-
-## 2.1. Vector 硬件设计
-
-| 项目         | 草案定义                                                                   |
-| ---------- | ---------------------------------------------------------------------- |
-| 标量寄存器      | Scalar Register File 包含 32 个 32-bit 寄存器 `x0–x31`；`x0` 固定为 0、只读，无时序存储逻辑 |
-| 向量寄存器      | `v0–v31`，每个 256 bit                                                    |
-| 运算元素       | INT32、BF16                                                             |
-| 运算宽度       | 固定 8 个 lane；每条算术指令最多处理 8 个元素，每个 lane 为 32 bit                            |
-| `.vv`      | 向量与向量                                                                  |
-| `.vx`      | 向量与 Scalar Register File 中的标量 `x[rs1]`；按指令语义解释为 INT32、BF16 或整数控制参数     |
-| `.vi`      | 向量与指令立即数，仅在适用指令中提供                                                     |
-| 掩码         | 显式指定向量寄存器 `vm`，使用其低 8 bit 控制 8 个 lane                                  |
-| 掩码关闭的 lane | 算术和加载保留原目的元素；存储不产生访存                                                   |
-| INT32 溢出   | 普通加减乘回绕，保留低 32 bit，不饱和、不触发异常；lane 之间不传递进位                              |
-| BF16 寄存器表示 | 每个 32-bit lane 的低 16 bit 存 BF16，高 16 bit 清零                            |
-| BF16 标量表示  | `x[rs1][15:0]` 保存 BF16 编码；写入 BF16 标量时高 16 bit 清零，BF16 运算读取时仅使用低 16 bit |
-| INT32 标量表示 | 使用 `x[rs1][31:0]` 的完整 32-bit 位模式；有符号运算按补码解释，无符号比较按 UINT32 解释           |
-
-BF16 不做整数符号扩展。它不是 INT16；转换成 FP32 必须使用浮点格式转换，不能把零扩展或符号扩展后的位模式直接作为 FP32 使用。该布局保持 BF16 与 FP32 的 lane 一一对应，一个向量寄存器只能容纳 8 个 BF16，而不是紧凑存放的 16 个。
-
-Scalar Register File 保存位模式，不依靠位模式自动识别类型，也不引入隐含类型标签。软件准备与指令要求一致的数据，指令决定读取的有效位及其解释方式：
-
-|操作类别|标量读取规则|示例|
-|---|---|---|
-|INT32 算术、逻辑与整数比较|读取完整 32 bit，按相应整数操作解释|`vadd.vx vd, vs2, x1`；`vmslt.vx vd, vs2, x1`|
-|BF16 算术与浮点比较|读取低 16 bit，按 BF16 浮点编码解释；不是 INT16，也不隐式执行 INT32 → BF16 转换|`vfadd.vx vd, vs2, x1`；`vmflt.vx vd, vs2, x1`|
-|元素移动距离、位移量等控制参数|按整数控制参数解释，不随被移动的数据是 BF16 还是 INT32 而改变|`vslideup.vx vd, vs2, x1` 中 `x1` 是整数元素移动距离，不是 BF16 数值|
-
-例如，`x1 = 0x00003F80` 在 BF16 指令中表示 `1.0`，在 INT32 指令中表示整数 `16256`。若希望表示整数 `1`，应存入 `0x00000001`；它不能直接作为 BF16 的 `1.0` 使用。`x0` 在 INT32 运算中提供整数零，在 BF16 运算中提供正零。
-
-本文使用 `.vx` 统一表示标量来自 `x` 寄存器，不使用要求独立浮点寄存器的 `.vf` 接口。`vfadd.vx`、`vmflt.vx` 等是 XiangJiang 自定义形式，不是标准 RVV 助记符或编码兼容声明；标准 RVV 对应的向量—浮点标量形式为 `.vf`。使用共享 Scalar Register File 也不自动意味着实现了其他 RISC-V 扩展。
-
-
-## 2.2. INT32 算术与位操作
-
-
-| 指令                  | 形式          | 语义                                  |
-| ------------------- | ----------- | ----------------------------------- |
-| `vadd`              | `.vv / .vx` | 逐 lane 加法，保留低 32 bit                |
-| `vsub`              | `.vv / .vx` | 逐 lane 减法，保留低 32 bit                |
-| `vmul`              | `.vv / .vx` | 逐 lane 乘法，保留低 32 bit                |
-| `vmax / vmin`       | `.vv / .vx` | 逐 lane 取有符号 INT32 最大值、最小值，不是整个向量的归约 |
-| `vand / vor / vxor` | `.vv / .vx` | 按位逻辑运算                              |
-| `vsll`              | `.vv / .vx` | 左移                                  |
-| `vsrl`              | `.vv / .vx` | 逻辑右移，补零                             |
-| `vsra`              | `.vv / .vx` | 算术右移，补符号位                           |
-
-
-## 2.3. 浮点算术
-
-向量计算算术单元直接处理 BF16，不要求软件先转换为 FP32 再执行算术。`.vv` 的两个输入来自向量寄存器各 lane 的低 16 bit；`.vx` 的向量输入来自同样的位置，标量输入来自 `x[rs1][15:0]`，直接按 BF16 解释并广播给所有启用的 lane。BF16 输出写入目的 lane 的低 16 bit，高 16 bit 清零。第 4 节的 FP32 格式转换是独立的显式操作，不是 BF16 算术的前置步骤；本约定不限定运算单元内部为实现舍入而使用的中间精度。
-
-|指令|形式|逐 lane 语义|
-|---|---|---|
-|`vfadd`|`.vv / .vx`|BF16 加法；`.vx` 为 `vd[i] = vs2[i] + BF16(x[rs1][15:0])`|
-|`vfsub`|`.vv / .vx`|BF16 减法；`.vx` 为向量减标量|
-|`vfmul`|`.vv / .vx`|BF16 乘法；`.vx` 为向量乘标量|
-|`vfdiv`|`.vv / .vx`|BF16 除法；`.vx` 为向量除标量|
-|`vfmacc`|`.vv / .vx`|BF16 融合乘加；`.vv` 为 `vd[i] = vs1[i] × vs2[i] + 旧 vd[i]`；`.vx` 将 `vs1[i]` 替换为 BF16 标量，最终结果只舍入一次|
-|`vfmax / vfmin`|`.vv / .vx`|逐 lane BF16 最大值、最小值，不是归约|
-
-这里的 `BF16(bits)` 表示按 BF16 解码位模式，不是把整数数值转换成 BF16。融合乘加沿用乘数在前的汇编顺序：
-
-```asm
-vfadd.vx  v8, v4, x1    # v8[i] = BF16(v4[i]) + BF16(x1[15:0])
-vfmacc.vx v8, x1, v4    # v8[i] = BF16(x1[15:0]) * BF16(v4[i]) + BF16(旧 v8[i])
-```
-
-向量 BF16 运算不改变矩阵单元的独立契约：`SketchNPU.md` §1.3 中的 BF16 矩阵单元仍使用 FP32 部分和跨 K 分块累加，最终才转换为 BF16 输出。
-
-
-## 2.4. 格式转换
-
-| 指令                 | 语义                     |
-| ------------------ | ---------------------- |
-| `vfwcvtbf16.f.f.v` | BF16 → FP32，精确扩宽       |
-| `vfncvtbf16.f.f.w` | FP32 → BF16，采用 RNE     |
-| `vfcvt.f.x.v`      | INT32 → FP32           |
-| `vfcvt.x.f.v`      | FP32 → INT32，`frm=RNE` |
-
-RNE 表示 Round to Nearest, ties to Even，即舍入到最近值，恰好处于中点时取最低有效位为偶数的结果。
-
-本节转换的输入、输出均位于向量寄存器中，不读取独立的浮点标量寄存器，也不因名字包含 `.f` 或 `.x` 就改变寄存器来源。其中 `.f` / `.x` 表示浮点／整数转换类型；FP32 中间值占用一个完整的 32-bit lane。与第 1 节的标量按类型读出不同，转换指令执行数值格式转换。
-
-
-## 2.5. 重排与归约
-### 2.5.1. 元素重排
-
-|指令|形式|语义|
-|---|---|---|
-|`vslideup`|`.vx / .vi`|将元素向较高 lane 索引方向移动指定距离，空出的位置补充相同元素类型的0|
-|`vslidedown`|`.vx / .vi`|将元素向较低 lane 索引方向移动指定距离，空出的位置补充相同元素类型的0|
-|`vrgather`|`.vv`|按索引向量从源向量寄存器中选取元素：`vd[i] = vs2[vs1[i]]`, 选择性实现|
-
-`vrgather.vv` 操作寄存器中的元素，不是按索引访问内存。标准 RVV 将索引视为无符号数，索引大于等于 `VLMAX` 时输出零。
-
-### 2.5.2. 浮点归约
-
-|名称|语义|
+|项目|定义|
 |---|---|
-|`vfredsum`|浮点求和归约|
-|`vfredmax`|浮点最大值归约|
+|ISA Profile|XJ-NPU-1.0|
+|指令长度|固定 32 bit，`IALIGN=32`|
+|标量宽度|XLEN=32|
+|字节序|小端|
+|目标指令数|85|
+|当前实现|仅实现 33 条 Scalar 指令，见 [xj-npu.md](xj-npu.md) 第 13 节|
 
-## 2.6. 比较、掩码与选择
+本文只定义软件可见的机器编码、架构状态、操作数、运算结果、存储布局和故障语义。流水线、ROB、RAT、FU、MemQ、TCM、AXI 和实现状态由 [xj-npu.md](xj-npu.md) 定义。
 
-|名称|形式|语义|
+XJ-ISA 借用部分 RISC-V RV32I/RVV 命名和编码风格，但不是完整 RV32I、RV32IMF 或 RVV 实现，也不声明标准兼容性。未在本文列出的编码均为非法指令。
+
+## 1. ISA 组成与架构状态
+
+### 1.1. 指令组成
+
+|执行域|数量|组成|
+|---|---:|---|
+|Scalar|33|21 条整数计算、8 条分支/跳转、`LW`、`SW`、`FENCE`、`HALT`|
+|Vector|38|36 条寄存器计算、`VLD`、`VST`|
+|Matrix|10|配置、tile 搬运、计算和同步|
+|Core DMA|4|二维尺寸/步长配置、`MVIN`、`MVOUT`|
+|合计|85|—|
+
+### 1.2. 架构状态
+
+|状态|定义|
+|---|---|
+|PC|32 bit；指令地址必须 4 B 对齐|
+|Scalar Register File|`x0–x31`，每个 32 bit；`x0` 恒为零|
+|Vector Register File|`v0–v31`，每个 256 bit，固定为 8 个 32-bit lane|
+|Matrix Unit|`u0/u1/u2` 各自具有已提交 A、B、ACC、有效位和 mode|
+|Core DMA 配置|`row_bytes`、`rows`、`external_stride`、`local_stride` 及有效位|
+|浮点控制|固定 RNE；无 `frm/fcsr`，无浮点异常标志|
+
+普通运行从 `PC=0` 开始。`HALT` 正常结束当前运行；故障通过 Host 状态报告，不进入指令级 Trap。ACK 和后续 START 保留已提交寄存器、Matrix 状态、DMA 配置和 SRAM；复位重新初始化架构寄存器及控制状态，但不保证清除 ITCM/DTCM。
+
+### 1.3. 记号
+
+- `u32(v)`：保留 `v` 的低 32 bit。
+- `s32(v)`：将 32-bit 位模式解释为二进制补码有符号整数。
+- `sext32(v)`：符号扩展到 32 bit。
+- `{a,b}`：位拼接。
+- 所有地址和步长均以 byte 为单位。
+
+## 2. 通用机器编码
+
+### 2.1. RV32 基本格式
+
+|格式|`inst[31:25]`|`inst[24:20]`|`inst[19:15]`|`inst[14:12]`|`inst[11:7]`|`inst[6:0]`|
+|---|---|---|---|---|---|---|
+|R|`funct7`|`rs2`|`rs1`|`funct3`|`rd`|`opcode`|
+|I|`imm[11:5]`|`imm[4:0]`|`rs1`|`funct3`|`rd`|`opcode`|
+|S|`imm[11:5]`|`rs2`|`rs1`|`funct3`|`imm[4:0]`|`opcode`|
+|B|`{imm[12],imm[10:5]}`|`rs2`|`rs1`|`funct3`|`{imm[4:1],imm[11]}`|`opcode`|
+|U|`imm[31:25]`|`imm[24:20]`|`imm[19:15]`|`imm[14:12]`|`rd`|`opcode`|
+|J|`{imm[20],imm[10:5]}`|`{imm[4:1],imm[11]}`|`imm[19:15]`|`imm[14:12]`|`rd`|`opcode`|
+
+|立即数|执行值|
+|---|---|
+|I|`sext32(inst[31:20])`|
+|S|`sext32({inst[31:25],inst[11:7]})`|
+|B|`sext32({inst[31],inst[7],inst[30:25],inst[11:8],0})`|
+|U|`{inst[31:12],12'b0}`|
+|J|`sext32({inst[31],inst[19:12],inst[20],inst[30:21],0})`|
+
+B/J 偏移的隐式低位零只保证 2 B 粒度，不保证目标满足 4 B 对齐。
+
+### 2.2. Opcode 空间
+
+|空间|Opcode|用途|
+|---|---:|---|
+|RV32 OP/OP-IMM 等|标准主 opcode|Scalar RV32I 子集|
+|XJ-V|`0x57`|36 条 Vector 寄存器计算指令|
+|`custom-0`|`0x0B`|`HALT`、`VLD/VST`、Core DMA|
+|`custom-1`|`0x2B`|`MSETMODE/MLOAD/MSTORE`|
+|`custom-2`|`0x5B`|Matrix compute|
+|`custom-3`|`0x7B`|Matrix 同步与屏障|
+
+`custom-0` 的分配如下：
+
+|`funct3`|定义|
+|---:|---|
+|`000`|仅完整机器字 `0x0000000B` 为 `HALT`|
+|`001`|`VLD`|
+|`010`|`VST`|
+|`011`|`DSETSIZE`|
+|`100`|`DSETSTRIDE`|
+|`101`|`MVIN`|
+|`110`|`MVOUT`|
+|`111`|保留，非法|
+
+## 3. Scalar ISA（33 条）
+
+### 3.1. 寄存器整数运算（10 条）
+
+全部使用 `opcode=0x33`。
+
+|指令|`funct3`|`funct7`|结果|
+|---|---:|---:|---|
+|`ADD rd,rs1,rs2`|`000`|`0000000`|`u32(x[rs1]+x[rs2])`|
+|`SUB rd,rs1,rs2`|`000`|`0100000`|`u32(x[rs1]-x[rs2])`|
+|`AND rd,rs1,rs2`|`111`|`0000000`|按位与|
+|`OR rd,rs1,rs2`|`110`|`0000000`|按位或|
+|`XOR rd,rs1,rs2`|`100`|`0000000`|按位异或|
+|`SLL rd,rs1,rs2`|`001`|`0000000`|`u32(x[rs1] << x[rs2][4:0])`|
+|`SRL rd,rs1,rs2`|`101`|`0000000`|逻辑右移 `x[rs2][4:0]`|
+|`SRA rd,rs1,rs2`|`101`|`0100000`|算术右移 `x[rs2][4:0]`|
+|`SLT rd,rs1,rs2`|`010`|`0000000`|`s32(x[rs1]) < s32(x[rs2]) ? 1 : 0`|
+|`SLTU rd,rs1,rs2`|`011`|`0000000`|无符号小于则 1，否则 0|
+
+其他 `funct7` 均非法，不实现 M 扩展编码。
+
+### 3.2. 立即数和 PC 相对运算（11 条）
+
+I 型整数操作使用 `opcode=0x13`；普通立即数先符号扩展。
+
+|指令|`funct3`|上部限制|结果|
+|---|---:|---|---|
+|`ADDI rd,rs1,imm12`|`000`|—|`u32(x[rs1]+sext32(imm12))`|
+|`ANDI rd,rs1,imm12`|`111`|—|按位与|
+|`ORI rd,rs1,imm12`|`110`|—|按位或|
+|`XORI rd,rs1,imm12`|`100`|—|按位异或|
+|`SLLI rd,rs1,shamt`|`001`|`inst[31:25]=0000000`|左移 `shamt`|
+|`SRLI rd,rs1,shamt`|`101`|`inst[31:25]=0000000`|逻辑右移 `shamt`|
+|`SRAI rd,rs1,shamt`|`101`|`inst[31:25]=0100000`|算术右移 `shamt`|
+|`SLTI rd,rs1,imm12`|`010`|—|有符号小于则 1|
+|`SLTIU rd,rs1,imm12`|`011`|—|立即数符号扩展后按无符号比较|
+|`LUI rd,imm20`|U，`opcode=0x37`|—|`{imm20,12'b0}`|
+|`AUIPC rd,imm20`|U，`opcode=0x17`|—|`u32(PC+{imm20,12'b0})`|
+
+### 3.3. Scalar 访存（2 条）
+
+|指令|编码|语义|
 |---|---|---|
-|`vmseq`|`.vv / .vx`|32-bit 整数相等比较|
-|`vmslt`|`.vv / .vx`|有符号 INT32 小于比较|
-|`vmsle`|`.vv / .vx`|有符号 INT32 小于等于比较|
-|`vmsltu`|`.vv / .vx`|无符号 UINT32 小于比较|
-|`vmsleu`|`.vv / .vx`|无符号 UINT32 小于等于比较|
-|`vmfeq`|`.vv / .vx`|BF16 相等比较|
-|`vmflt`|`.vv / .vx`|BF16 小于比较|
-|`vmfle`|`.vv / .vx`|BF16 小于等于比较|
-|`vmerge.vvm`|向量、向量、掩码|根据掩码逐 lane 选择两个源向量之一|
-
-本项目的整数与 BF16 标量比较均从 Scalar Register File 读取 `x[rs1]`：整数比较读取完整 32 bit，BF16 比较读取低 16 bit 并按浮点值比较，不是比较 BF16 编码的整数大小。比较的真假结果写入目的掩码寄存器对应的 bit。
-
-```asm
-vmslt.vx v0, v4, x1    # v0[i] = INT32(v4[i]) < INT32(x1[31:0])
-vmflt.vx v0, v4, x1    # v0[i] = BF16(v4[i]) < BF16(x1[15:0])
-```
-
-上述 `vmf*.vx` 为自定义形式；不能套用标准 RVV `.vf` 从浮点寄存器读取标量的接口。
-
-
-
-# 3. Matrix ISA
-
-## 3.1. Matrix 硬件设计
-
-三个矩阵单元均采用 8 × 8 阵列，每个阵列包含 64 个 PE，并以 8 × 8 tile 为基本处理单位。
-
-| 阵列   | 数据类型 | 数据流   | 累加与输出                              |
-| ---- | ---- | ----- | ---------------------------------- |
-| `u0` | BF16 | 固定 OS | BF16×BF16，FP32 累加；结果 RNE 转为 BF16   |
-| `u1` | INT8 | OS/WS | 有符号 INT8×INT8，乘积扩展为 INT32；输出 INT32 |
-| `u2` | INT8 | OS/WS | 有符号 INT8×INT8，乘积扩展为 INT32；输出 INT32 |
-- 每条矩阵计算指令处理一个完整的 `8 × 8` tile。
-- 每个 unit 有 A/B 输入 skew buffer 和内部累加器。A、B 从 DTCM 通过 `MLOAD` 装入，结果通过 `MSTORE` 写回 DTCM。
-- tile 为行主序、紧密排列，不携带 stride。输入/输出地址由标量 `x` 寄存器提供。
-- 矩阵任务按序进入 MemQ；只有 MemQ 队首且 ROB 队首授权后，load、compute 或 store 才能启动。当前策略最多一个 MemQ 项 active。
-
-## 3.2. Matrix 指令集
-
-| 指令         | 功能                                |
-| ---------- | --------------------------------- |
-| `MSETMODE` | 设置 `u1/u2` 的 OS 或 WS 数据流模式        |
-| `MLOAD`    | 从 DTCM 将 A、B 或累加器 tile 装入矩阵单元     |
-| `MMUL`     | 使用已装入的 A/B：`ACC = A × B`          |
-| `MMACC`    | 使用已装入的 A/B：`ACC = ACC + A × B`    |
-| `MEW`      | 使用已装入的 A/B：`ACC = A ⊙ B`          |
-| `MTRANS`   | 使用已装入的 A：`ACC = Aᵀ`               |
-| `MSTORE`   | 将内部累加器/结果 tile 写回 DTCM            |
-| `MWAIT`    | 等待指定阵列的当前任务完成                     |
-| `MBARRIER` | 等待此前矩阵/DMA 工作完成的局部屏障              |
-| `MFENCE`   | 矩阵显式屏障；与 Scalar `FENCE` 的矩阵覆盖语义等价 |
-
-## 3.3. RISC-V opcode
-
-Scalar ISA 已使用完整机器字 `0x0000000B` 作为 `HALT`，矩阵不使用 `custom-0`：
-
-| 空间         | opcode | 用途                            |
-| ---------- | ------ | ----------------------------- |
-| `custom-0` | `0x0B` | Scalar `HALT`，已占用             |
-| `custom-1` | `0x2B` | `MSETMODE`、`MLOAD`、`MSTORE`   |
-| `custom-2` | `0x5B` | `MMUL`、`MMACC`、`MEW`、`MTRANS` |
-| `custom-3` | `0x7B` | `MWAIT`、`MBARRIER`、`MFENCE`   |
-
-参考：[RISC-V opcode map](https://docs.riscv.org/reference/isa/unpriv/rv-32-64g.html)。自定义 opcode 不表示与标准 RISC-V 扩展兼容；未列出的编码必须作为非法指令处理。
-
-## 3.4. `custom-1 = 0x2B` 数据搬运
-
-使用 R-type 字段：
+|`LW rd,imm12(rs1)`|I，`opcode=0x03, funct3=010`|从 `EA` 加载小端 32-bit 字|
+|`SW rs2,imm12(rs1)`|S，`opcode=0x23, funct3=010`|向 `EA` 存储已捕获的 `x[rs2]`|
 
 ```text
-31        25 24    20 19    15 14  12 11        7 6       0
-┌───────────┬────────┬────────┬──────┬───────────┬─────────┐
-│  funct7   │  rs2   │  rs1   │unit  │    rd     │ 0x2B    │
-└───────────┴────────┴────────┴──────┴───────────┴─────────┘
+EA = u32(x[rs1] + sext32(imm12))
 ```
 
-`unit=000/001/010` 分别选择 `u0/u1/u2`，`unit=011` 保留。
+EA 必须 4 B 对齐，完整 4 B 必须位于零基 DTCM `[0x00000000,0x00100000)`。同时未对齐和越界时优先报告未对齐。`LW x0` 仍须执行访问和故障检查，只丢弃寄存器结果。
 
-|指令|`funct7`|`funct3`|寄存器字段|
+### 3.4. 分支与跳转（8 条）
+
+条件分支使用 B 型 `opcode=0x63`。
+
+|指令|`funct3`|条件|
+|---|---:|---|
+|`BEQ rs1,rs2,offset`|`000`|位模式相等|
+|`BNE rs1,rs2,offset`|`001`|位模式不等|
+|`BLT rs1,rs2,offset`|`100`|有符号小于|
+|`BGE rs1,rs2,offset`|`101`|有符号大于等于|
+|`BLTU rs1,rs2,offset`|`110`|无符号小于|
+|`BGEU rs1,rs2,offset`|`111`|无符号大于等于|
+
+|指令|编码|目标|链接值|
 |---|---|---|---|
-|`MSETMODE unit, mode`|`0000000`|`unit`|`rs2[0]=mode`，其余 `rs2` 位、`rs1`、`rd` 必须为 0|
-|`MLOAD unit, buffer, rsA`|`00001bb`|`unit`|`rs1=rsA`，`rs2=0`，`rd=0`|
-|`MSTORE unit, rsC`|`0001000`|`unit`|`rs1=rsC`，`rs2=0`，`rd=0`|
+|`JAL rd,offset`|J，`opcode=0x6F`|`u32(PC+offset)`|`u32(PC+4)`|
+|`JALR rd,imm12(rs1)`|I，`opcode=0x67, funct3=000`|`u32(x[rs1]+imm) & 0xFFFFFFFE`|`u32(PC+4)`|
 
-`MLOAD` 的 `bb` 低两位选择 buffer：`00=A`、`01=B`、`10=ACC`，`11` 保留；因此对应 `funct7=0x04/0x05/0x06`。`MSTORE` 写出当前内部累加器/结果，不写标量寄存器。
+本设计无分支预测。只检查实际选中的下一 PC：它必须 4 B 对齐且位于 ITCM `[0x00000000,0x00040000)`。目标错误归属于当前控制转移指令，并禁止链接值提交。`JALR rd=rs1` 合法，目标使用旧源值。
 
-`MSETMODE` 是控制屏障：只有更早任务完成并提交后，新模式才生效；活动任务期间不能切换模式。`u0` 只允许 `OS`，`u1/u2` 允许 `OS` 和 `WS`。复位后的模式为 `OS`。
+### 3.5. 屏障与终止（2 条）
 
-## 3.5. `custom-2 = 0x5B` 矩阵计算
+|指令|合法编码|语义|
+|---|---|---|
+|`FENCE pred,succ`|`opcode=0x0F, funct3=000`|保守全局屏障，忽略字段细分并排空所有更早工作|
+|`HALT`|仅 `0x0000000B`|排空更早工作后正常结束当前运行|
 
-计算指令也使用 R-type 字段；`rd` 字段在本扩展中表示 `rsC`，但计算指令不写标量寄存器：
+`FENCE` 不进行 cache maintenance，也不实现 `FENCE.I`。`HALT` 不是复位、Trap、`WFI` 或 `EBREAK`。
+
+### 3.6. 常用伪指令
+
+|伪指令|展开|
+|---|---|
+|`NOP`|`ADDI x0,x0,0`|
+|`MV rd,rs`|`ADDI rd,rs,0`|
+|`NOT rd,rs`|`XORI rd,rs,-1`|
+|`NEG rd,rs`|`SUB rd,x0,rs`|
+|`J offset`|`JAL x0,offset`|
+|`JR rs`|`JALR x0,0(rs)`|
+|`RET`|`JALR x0,0(x1)`|
+
+## 4. Vector ISA（38 条）
+
+### 4.1. 数据组织与掩码
+
+- Vector Register File 固定为 32×256 bit，不设置 `vl/vtype`。
+- 每个寄存器包含 8 个 32-bit lane。
+- INT32/FP32 使用完整 lane；BF16 使用低 16 bit，规范结果将高 16 bit 清零。
+- `.vx` 的 Scalar 源来自 `x[rs1]`：整数使用全部 32 bit，BF16 只读取低 16 bit。
+- `vm=1` 表示全部 lane 启用；`vm=0` 使用派发时捕获的旧 `v0[7:0]`，汇编可写 `,v0.t`。
+- 被关闭的普通目的 lane 保留完整旧 32-bit 位模式；归约跳过关闭 lane。
+- `VLD/VST` 是无掩码的 32 B 全寄存器访问。
+
+比较指令产生规范掩码：启用 lane 的真假结果写入 `vd[i]`，关闭 lane 保留旧 `vd[i]`，`vd[255:8]` 清零。若 `vd=v0`，执行掩码仍使用旧 `v0`。
+
+### 4.2. XJ-V 编码
 
 ```text
-31        25 24    20 19    15 14  12 11        7 6       0
-┌───────────┬────────┬────────┬──────┬───────────┬─────────┐
-│  funct7   │  rsB   │  rsA   │unit  │  reserved │ 0x5B    │
-└───────────┴────────┴────────┴──────┴───────────┴─────────┘
+31       26 25 24      20 19      15 14   12 11       7 6       0
+┌──────────┬──┬──────────┬──────────┬───────┬──────────┬─────────┐
+│  funct6  │vm│   vs2    │vs1/rs1/u5│funct3 │    vd    │  0x57   │
+└──────────┴──┴──────────┴──────────┴───────┴──────────┴─────────┘
 ```
 
-计算指令不需要地址寄存器：地址已由 `MLOAD/MSTORE` 提供，`rs1/rs2/rd` 必须为 0。`funct3[1:0]` 为 unit，`funct3[2]` 必须为 0。
+|`funct3`|形式|字段解释|
+|---:|---|---|
+|`000`|`.vv`|`op.vv vd,vs2,vs1`|
+|`100`|`.vx`|`op.vx vd,vs2,rs1`|
+|`011`|`.vi`|`op.vi vd,vs2,uimm5`，`uimm5=inst[19:15]`|
+|`010`|一元 `.v`|`vs2` 为源，`inst[19:15]=0`|
+|`001`|归约 `.vs`|`vs2` 为数据，`vs1[0]` 为 FP32 初值|
 
-|指令|`funct7`|要求|
+二元运算固定按 `op(vs2,vs1/scalar)` 计算，减法、除法和比较不得交换源。
+
+|`funct6`|操作|合法形式|`funct6`|操作|合法形式|
+|---:|---|---|---:|---|---|
+|`0x00`|`vadd`|`.vv/.vx`|`0x12`|`vfwcvtbf16.f.f.v`|一元 `.v`|
+|`0x01`|`vsub`|`.vv/.vx`|`0x13`|`vfncvtbf16.f.f.w`|一元 `.v`|
+|`0x02`|`vmul`|`.vv/.vx`|`0x14`|`vfcvt.f.x.v`|一元 `.v`|
+|`0x03`|`vmax`|`.vv/.vx`|`0x15`|`vfcvt.x.f.v`|一元 `.v`|
+|`0x04`|`vmin`|`.vv/.vx`|`0x16`|`vslideup`|`.vx/.vi`|
+|`0x05`|`vand`|`.vv/.vx`|`0x17`|`vslidedown`|`.vx/.vi`|
+|`0x06`|`vor`|`.vv/.vx`|`0x18`|`vrgather`|`.vv`|
+|`0x07`|`vxor`|`.vv/.vx`|`0x19`|`vfredsum`|`.vs`|
+|`0x08`|`vsll`|`.vv/.vx`|`0x1A`|`vfredmax`|`.vs`|
+|`0x09`|`vsrl`|`.vv/.vx`|`0x1B`|`vmseq`|`.vv/.vx`|
+|`0x0A`|`vsra`|`.vv/.vx`|`0x1C`|`vmslt`|`.vv/.vx`|
+|`0x0B`|`vfadd`|`.vv/.vx`|`0x1D`|`vmsle`|`.vv/.vx`|
+|`0x0C`|`vfsub`|`.vv/.vx`|`0x1E`|`vmsltu`|`.vv/.vx`|
+|`0x0D`|`vfmul`|`.vv/.vx`|`0x1F`|`vmsleu`|`.vv/.vx`|
+|`0x0E`|`vfdiv`|`.vv/.vx`|`0x20`|`vmfeq`|`.vv/.vx`|
+|`0x0F`|`vfmacc`|`.vv/.vx`|`0x21`|`vmflt`|`.vv/.vx`|
+|`0x10`|`vfmax`|`.vv/.vx`|`0x22`|`vmfle`|`.vv/.vx`|
+|`0x11`|`vfmin`|`.vv/.vx`|`0x23`|`vmerge.vvm`|`.vv` 且 `vm=0`|
+
+未列出的 `funct6/funct3` 组合和非零保留字段均非法。
+
+### 4.3. INT32 运算
+
+|指令|逐 lane 语义|
+|---|---|
+|`vadd/vsub`|加减后保留低 32 bit|
+|`vmul`|乘积保留低 32 bit|
+|`vmax/vmin`|有符号 INT32 最大/最小值|
+|`vand/vor/vxor`|按位逻辑|
+|`vsll/vsrl/vsra`|移位量取第二操作数低 5 bit|
+
+整数运算不饱和、不产生溢出故障，lane 之间不传递进位。
+
+### 4.4. BF16 与转换
+
+BF16 和 FP32 遵循 IEEE 754 二进制格式，固定 RNE，支持无穷、带符号零和次正规数，不采用 FTZ/DAZ。算术 NaN 规范化为 BF16 `0x7FC0` 或 FP32 `0x7FC00000`；浮点特殊值不产生故障或异常标志。
+
+|指令|语义|
+|---|---|
+|`vfadd/vfsub/vfmul/vfdiv`|按无限精度结果一次舍入到 BF16|
+|`vfmacc`|`vs2×vs1/scalar+old vd`，最终只舍入一次|
+|`vfmax/vfmin`|一侧 NaN 时返回数值侧；均为 NaN 时返回规范 NaN|
+|`vfwcvtbf16.f.f.v`|BF16 位模式左移 16 bit，精确扩宽并保留 NaN payload|
+|`vfncvtbf16.f.f.w`|FP32→BF16，RNE；NaN 规范化|
+|`vfcvt.f.x.v`|signed INT32→FP32，RNE|
+|`vfcvt.x.f.v`|FP32→signed INT32，RNE；NaN/正溢出取 `INT32_MAX`，负溢出取 `INT32_MIN`|
+
+补充规则：
+
+- 有限非零数除以 ±0 得到带符号无穷；`0/0` 和 `∞/∞` 得到规范 NaN。
+- `max(+0,-0)=+0`，`min(+0,-0)=-0`。
+- `vmfeq/vmflt/vmfle` 任一操作数为 NaN 时均返回假；`+0==-0`。
+- XJ-NPU-1.0 不包含 `Vexp/Vrcp/Vrsqrt`。
+
+### 4.5. 置换与归约
+
+|指令|语义|
+|---|---|
+|`vslideup`|距离 `d`；`i>=d` 时写 `vs2[i-d]`，否则写零|
+|`vslidedown`|距离 `d`；`i+d<8` 时写 `vs2[i+d]`，否则写零|
+|`vrgather.vv`|索引按 UINT32 解释；0–7 选择源 lane，其他值返回零|
+|`vmerge.vvm`|旧 `v0[i]=1` 选择 `vs1[i]`，否则选择 `vs2[i]`|
+
+`.vi` 距离为零扩展 `uimm5`，`.vx` 距离使用完整 UINT32；距离大于等于 8 时启用 lane 全部写零。源在执行前捕获，允许目的与源重叠。
+
+`vfredsum.vs` 和 `vfredmax.vs` 将 `vs2` 解释为 FP32，以 `vs1[0]` 为初值，按 lane 0→7 的固定顺序处理启用元素。每一步均产生 FP32 RNE 结果，不允许树形重排。结果写入 `vd[0]`，`vd[7:1]` 保留旧值；无启用 lane 时 `vd[0]=vs1[0]`。
+
+### 4.6. Vector 访存（2 条）
+
+|指令|编码|语义|
 |---|---|---|
-|`MMUL unit`|`0000000`|A、B 已装入；清零内部累加器后计算 `ACC=A×B`|
-|`MMACC unit`|`0000001`|A、B 已装入；计算 `ACC=ACC+A×B`|
-|`MEW unit`|`0000010`|A、B 已装入；计算 `ACC=A⊙B`|
-|`MTRANS unit`|`0000011`|A 已装入，B 必须未使用；计算 `ACC=Aᵀ`|
+|`VLD vd,imm12(rs1)`|I，`opcode=0x0B, funct3=001`|加载连续 32 B|
+|`VST vs3,imm12(rs1)`|S，`opcode=0x0B, funct3=010`|存储连续 32 B|
 
-`MLOAD.ACC` 可在 `MMACC` 前从 DTCM 读取已有 C tile 作为初始累加器。u0 的 ACC 以 FP32 保存，写回 u0 结果时 RNE 转 BF16；u1/u2 的 ACC 为 INT32。`MTRANS` 保持输入元素类型，`MEW` 按对应 unit 的结果格式写回。
+`VST` 使用 `vs3=inst[24:20]`，立即数仍按 S 型拼接。EA 按 32-bit Scalar 加法回绕后检查，必须 32 B 对齐，完整 32 B 必须位于 DTCM；未对齐优先于越界。lane `i` 对应 `EA+4*i…EA+4*i+3`。VLD 只有在完整 32 B 读取成功后才更新 `vd`；VST 按程序顺序产生存储器副作用。
 
-## 3.6. `custom-3 = 0x7B` 同步
+## 5. Matrix ISA（10 条）
 
-同步指令的保留字段必须为零：
+### 5.1. Matrix 状态与 tile 布局
 
-|指令|固定字段|其他字段|
-|---|---|---|
-|`MWAIT unit`|`funct3=000`，`inst[31:30]=unit`|`inst[29:0]=0`|
-|`MFENCE`|`funct3=001`|除 opcode/funct3 外全部为 0|
-|`MBARRIER id`|`funct3=010`，`inst[31:27]=id`|`inst[26:0]=0`|
+|Unit|输入|内部 ACC|数据流|
+|---|---|---|---|
+|`u0`|BF16 A/B|8×8 FP32|固定 OS|
+|`u1`|signed INT8 A/B|8×8 INT32|OS/WS|
+|`u2`|signed INT8 A/B|8×8 INT32|OS/WS|
 
-`unit=0/1/2` 合法，`unit=3` 非法；`id` 为 5-bit 软件标签。当前单 active MemQ 策略下，`MBARRIER` 等待所有更早矩阵/DMA 工作完成；不同 `id` 只保留软件同步命名空间，不增加硬件并发。
+|对象|DTCM 大小|对齐|布局|
+|---|---:|---:|---|
+|u0 A/B|各 128 B|64 B|64×BF16，row-major|
+|u0 ACC load/store|128 B|64 B|外部 BF16；加载扩宽、存储 RNE 窄化|
+|u1/u2 A/B|各 64 B|64 B|64×signed INT8，row-major|
+|u1/u2 ACC load/store|256 B|64 B|64×INT32，小端、row-major|
 
-## 3.7. 数据移动与执行规则
+只支持完整 8×8 tile，不支持行列掩码。边界 tile 由软件补零。复位时 mode=OS，A/B/ACC 数据清零且有效位清零；ACK 和后续 START 保留已提交状态。
 
-1. `MLOAD.A/B` 将一个完整 `8 × 8` tile 写入对应 unit 的 A/B skew buffer；`MLOAD.ACC` 将 DTCM 中的 C tile 转换为内部累加格式。
-2. `MLOAD`、计算和 `MSTORE` 均按序分配 ROB；有 DTCM 访问的 `MLOAD/MSTORE` 预留 MemQ 项。
-3. 计算只能使用已完成的 A/B load 和当前 mode；不能在执行阶段重新读取标量寄存器或 DTCM 地址。
-4. `MSTORE` 必须等待对应计算完成，并将整个结果 tile 写入 DTCM。已写入的字节在后续故障中不回滚。
-5. 地址必须满足实现规定的 tile 对齐，完整 tile 必须落在 DTCM 范围内；检查必须先于 SRAM 索引截断。DTCM bank 冲突按既有内存互连规则处理。
-6. 未对齐、越界、非法 unit/mode、错误 buffer 或非法 opcode 都产生矩阵故障；矩阵专用故障码尚未在 `sketchNPU.md` 中定义，不能冒用 Scalar ISA §8 的加载/存储故障码。
-7. Scalar `FENCE` 已覆盖标量、向量、矩阵和 DMA；`MFENCE` 是矩阵程序的显式同义屏障，不是 ALU 空操作。
+### 5.2. `custom-1`：配置和 tile 搬运
 
-## 5. 示例
+使用 R 型字段，`funct3=unit`；`unit=000/001/010` 对应 `u0/u1/u2`，其他值非法。
+
+|指令|`funct7`|字段约束|语义|
+|---|---:|---|---|
+|`MSETMODE unit,mode`|`0000000`|`rs1=rd=0`；`rs2=0/1`|设置 OS/WS|
+|`MLOAD unit,A,rsA`|`0000100`|`rs1=rsA, rs2=rd=0`|加载 A|
+|`MLOAD unit,B,rsA`|`0000101`|同上|加载 B|
+|`MLOAD unit,ACC,rsA`|`0000110`|同上|加载 ACC|
+|`MSTORE unit,rsC`|`0001000`|`rs1=rsC, rs2=rd=0`|存储已提交 ACC|
+
+`MSETMODE` 的 mode 是编码立即数：0=OS，1=WS。u0 只接受 OS；u1/u2 接受 OS/WS。其他 mode 编码非法。
+
+MLOAD 只有在完整 tile 读取成功后才原子替换目标 A/B/ACC，失败时保留旧状态。MSTORE 要求 ACC 有效，并在地址和完整 tile 通过预检查后写出结果。
+
+### 5.3. `custom-2`：Matrix compute
+
+`opcode=0x5B`，`funct3=unit`，`rs1=rs2=rd=0`。
+
+|指令|`funct7`|输入要求|结果|
+|---|---:|---|---|
+|`MMUL unit`|`0000000`|A/B 有效|从正零开始计算 `ACC=A×B`|
+|`MMACC unit`|`0000001`|A/B/ACC 有效|`ACC=ACC+A×B`|
+|`MEW unit`|`0000010`|A/B 有效|`ACC=A⊙B`|
+|`MTRANS unit`|`0000011`|A 有效|`ACC=Aᵀ`，不读取 B|
+
+u0 矩阵乘法按 `k=0…7` 顺序执行：
+
+```text
+acc = RNE_FP32(acc + exact(BF16(A) × BF16(B)))
+```
+
+u1/u2 将 signed INT8 乘积符号扩展到 INT32，每次累加按模 2^32 回绕。MEW/MTRANS 在 u0 中产生 FP32 ACC，在 u1/u2 中产生 INT32 ACC。OS/WS 只改变内部数据移动，不改变架构结果。
+
+### 5.4. `custom-3`：同步
+
+除参数字段、`funct3` 和 `opcode=0x7B` 外，其余位必须为零。
+
+|指令|`funct3`|参数|语义|
+|---|---:|---|---|
+|`MWAIT unit`|`000`|`unit=inst[31:30]`|等待指定 MU 的任务和完成记录清空|
+|`MFENCE`|`001`|无|与 Scalar `FENCE` 同义的全局屏障|
+|`MBARRIER id`|`010`|`id=inst[31:27]`|等待所有更早 Matrix/DMA 工作|
+
+`unit=3` 非法。`id` 只保留软件同步命名空间，不增加硬件并发。
+
+### 5.5. Matrix 地址和状态故障
+
+所有 tile 地址必须 64 B 对齐，完整 64/128/256 B 范围必须位于 DTCM。范围计算使用至少 33 bit 中间值，禁止地址回绕；未对齐优先于越界。
+
+非法 unit、mode、buffer 或保留字段产生非法指令。编码合法但缺少所需 A/B/ACC 有效位时产生 Matrix 状态故障。
+
+## 6. Core DMA ISA（4 条）
+
+四条指令均使用 R 型 `opcode=0x0B, funct7=0000000, rd=x0`。
+
+|指令|`funct3`|`rs1`|`rs2`|语义|
+|---|---:|---|---|---|
+|`DSETSIZE rsRowBytes,rsRows`|`011`|`row_bytes`|`rows`|设置二维尺寸|
+|`DSETSTRIDE rsExtStride,rsLocalStride`|`100`|`external_stride`|`local_stride`|设置二维步长|
+|`MVIN rsExternal,rsLocal`|`101`|外部首地址|DTCM 首地址|外部→DTCM|
+|`MVOUT rsExternal,rsLocal`|`110`|外部首地址|DTCM 首地址|DTCM→外部|
+
+`MVIN/MVOUT` 的 `rs1` 始终是外部首地址，`rs2` 始终是 DTCM 首地址；助记符只决定数据方向。
+
+`DSETSIZE` 要求 `row_bytes>0`、`rows>0` 且 `row_bytes` 4 B 对齐。`DSETSTRIDE` 要求两个 stride 为 4 B 整数倍，允许为零。两条配置按程序顺序生效；合法执行后更新状态并置对应有效位，发生故障时保留旧配置。
+
+MVIN/MVOUT 要求两个配置有效、两个 base 4 B 对齐，并在产生任何访问前完成全命令预检查：
+
+```text
+last_row         = rows - 1
+ext_last_byte    = external_base + last_row × external_stride + row_bytes - 1
+local_last_byte  = local_base    + last_row × local_stride    + row_bytes - 1
+```
+
+计算使用 65 bit 或等价带进位检查。`ext_last_byte<2^32`，`local_last_byte<1 MiB`。行按 `0…rows-1` 顺序执行，允许零 stride 和行间重叠；重叠 MVIN 的后执行行覆盖先执行行。
+
+每行拆成不跨 4 KiB、长度不超过 256 B 的 AXI burst，最多 4 个同方向 burst 在途。发生错误后停止发出新的 burst，并排空已接受事务；已成功写入的数据不回滚。AXI ID/LAST 破坏导致响应无法归属时进入 `BUS_POISONED`，只能平台复位。
+
+## 7. 故障与运行终止
+
+### 7.1. 故障码
+
+这些故障码是 XJ-NPU 本地 Host 接口约定，不是 privileged RISC-V `mcause`。
+
+|码|名称|`FAULT_ADDR`|
+|---:|---|---|
+|0|无故障|0|
+|1|非法指令|原始机器字|
+|2|取指/控制目标未对齐|故障地址|
+|3|取指/控制目标越界|故障地址|
+|4|Scalar load 未对齐|EA|
+|5|Scalar load 访问故障|EA|
+|6|Scalar store 未对齐|EA|
+|7|Scalar store 访问故障|EA|
+|8|Vector load 未对齐|EA|
+|9|Vector load 访问故障|EA|
+|10|Vector store 未对齐|EA|
+|11|Vector store 访问故障|EA|
+|12|Matrix tile 未对齐|tile base|
+|13|Matrix tile 访问故障|tile base|
+|14|Matrix 运行时状态故障|0|
+|15|DMA 配置或地址故障|非法值或失败地址|
+|16|DMA 外部读响应错误|失败 burst 地址|
+|17|DMA 外部写响应错误|失败 burst 地址|
+|18|DMA/AXI 协议失配|相关地址或 0|
+
+`FAULT_DETAIL[31:24]` 为域（1=Vector、2=Matrix、3=DMA），`[23:16]` 为域内原因或 AXI RESP，`[15:0]` 为 lane、unit/buffer 或 DMA row 索引。
+
+### 7.2. 故障处理
+
+普通故障在精确指令边界处理：
+
+1. 锁存 `FAULT_PC/INST/CAUSE/ADDR/DETAIL`，停止启动年轻工作。
+2. 故障指令不产生正常成功结果，年轻指令的结果不可见。
+3. 更老的架构状态以及已经发生的 Store/MSTORE/DMA 部分副作用保留，不执行回滚。
+4. 安全排空已接受的存储器事务后清除 BUSY 并置 FAULT。
+5. Host ACK 后可从 PC=0 再次 START。
+
+`BUS_POISONED` 是例外：保持 BUSY/owner，不接受 ACK、START 或 Host SRAM 访问，只能平台复位。
+
+## 8. 指令清单
+
+|执行域|指令|
+|---|---|
+|Scalar 计算|`ADD SUB AND OR XOR SLL SRL SRA SLT SLTU ADDI ANDI ORI XORI SLLI SRLI SRAI SLTI SLTIU LUI AUIPC`|
+|Scalar 访存/控制|`LW SW BEQ BNE BLT BGE BLTU BGEU JAL JALR FENCE HALT`|
+|Vector INT|`vadd vsub vmul vmax vmin vand vor vxor vsll vsrl vsra`|
+|Vector BF16|`vfadd vfsub vfmul vfdiv vfmacc vfmax vfmin`|
+|Vector 转换|`vfwcvtbf16.f.f.v vfncvtbf16.f.f.w vfcvt.f.x.v vfcvt.x.f.v`|
+|Vector 置换/归约|`vslideup vslidedown vrgather vfredsum vfredmax`|
+|Vector 比较/选择|`vmseq vmslt vmsle vmsltu vmsleu vmfeq vmflt vmfle vmerge.vvm`|
+|Vector 访存|`VLD VST`|
+|Matrix|`MSETMODE MLOAD MSTORE MMUL MMACC MEW MTRANS MWAIT MBARRIER MFENCE`|
+|Core DMA|`DSETSIZE DSETSTRIDE MVIN MVOUT`|
+
+## 9. 示例
 
 ```asm
-# x10/x11/x12 分别保存 A/B/C 的 DTCM tile 地址
+# Vector BF16 FMA
+vfmacc.vx v8, v4, x1
+
+# BF16 Matrix tile
 MSETMODE u0, OS
 MLOAD    u0, A, x10
 MLOAD    u0, B, x11
 MMUL     u0
-MWAIT    u0
 MSTORE   u0, x12
 
-# INT8 weight-stationary
-MSETMODE u1, WS
-MLOAD    u1, A, x10
-MLOAD    u1, B, x11
-MMUL     u1
-MWAIT    u1
-MSTORE   u1, x12
-MFENCE
+# 二维 DMA：外部 x20 -> DTCM x21
+DSETSIZE   x1, x2
+DSETSTRIDE x3, x4
+MVIN       x20, x21
+FENCE
+HALT
 ```

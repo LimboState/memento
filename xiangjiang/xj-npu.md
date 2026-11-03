@@ -1,552 +1,618 @@
+# XiangJiang NPU 微架构规范
 
-## 1. 架构概述
-
-XiangJiang NPU 采用顺序单发射的 Dispatch，Out-Of-Order 执行，最后通过 ROB 顺序提交。
-
-INT8、INT16 和 INT32 分别表示相应位宽的有符号整数格式；UINT32 表示 32 位无符号整数。BF16 表示 16 位脑浮点格式，FP32 表示 32 位浮点格式。`bit` 表示位，`B` 表示字节，`KiB` 表示 1024 B。
-
-|执行域|职责与边界|
+|项目|定义|
 |---|---|
-|标量|整数运算、地址生成、条件求值和分支目标计算；不执行向量 BF16 运算，也不能绕过全局提交控制|
-|向量|固定 8 个 32 位通道，一条向量指令一次最多处理 8 个元素；支持基于寄存器的向量运算、格式转换、置换和归约；标量接口共用 `x` 寄存器命名空间，不设置独立的标量浮点寄存器堆|
-|矩阵|一个 BF16 8×8 阵列、两个 INT8 8×8 阵列及其各自的输入缓冲区和任务控制器；每次阵列操作处理一个 8×8 tile，内部累加器不参与标量或向量寄存器重命名|
+|架构|顺序单发射、乱序执行、ROB 顺序提交|
+|ISA|[XJ-ISA 1.0](xj-isa.md)，目标共 85 条指令|
+|标量|32×32-bit X Register，无独立 Scalar FP Register File|
+|向量|32×256-bit V Register，8×32-bit lane|
+|矩阵|1×BF16 8×8、2×INT8 8×8，共 192 PE|
+|存储|256 KiB ITCM、1 MiB 四 bank DTCM|
+|前端|32-bit 指令，无分支预测|
+|存储顺序|统一 MemQ，同一时刻至多一个活动表项|
+|当前 RTL|仅实现 33 条 Scalar 指令，见第 13 节|
 
-统一前端从指令紧耦合存储器（ITCM）取指，随后执行合法性检查、译码、源版本捕获、目的寄存器重命名和顺序派发。后端结构的职责如下：
+本文定义 XJ-NPU 的流水线、状态结构、功能单元、存储层次、DMA、Host 接口和实现约束。软件可见的机器编码、操作数、数值和故障语义以 [xj-isa.md](xj-isa.md) 为准。
 
-- **保留站（RS）：** 保存源操作数值或依赖标签。当操作数就绪且目标功能单元（FU）能够接收时，指令即可发射。
-- **寄存器别名表（RAT）：** `RAT-X` 和 `RAT-V` 将架构目的寄存器映射到其最新的未提交版本。重命名不覆盖 PC、主机控制寄存器、矩阵累加器或数据存储器地址。
-- **重排序缓冲区（ROB）：** 按程序顺序分配表项，并记录结果、完成状态和异常。统一提交控制器只处理 ROB 头部，并控制架构寄存器更新、配置更新、不可逆存储器操作授权、正常终止以及故障引起的停机。
-- **存储器队列（MemQ）：** 由统一数据存储器控制器维护。它按照第 5 节的规定，对发往数据紧耦合存储器（DTCM）或外部接口的标量、向量、矩阵和直接存储器访问（DMA）请求进行排序。
+“目标设计”表示已确定的架构契约，不表示 Vector、Matrix 和 Core DMA 已在当前 RTL 中实现或验证。
 
-基线设计的取指、派发和提交宽度均为每周期至多一条指令。不同 FU 可以在同一周期从指令窗口发射各自已就绪的指令。乱序多发射并不意味着多指令取指或派发。增加派发或提交宽度需要相应的端口，以及明确的同周期排序和旁路规则。
+## 1. 总体架构
 
-本设计不预测分支，也不会越过尚未解析的控制转移继续执行。同一时刻至多有一个 MemQ 表项处于活动状态。彼此独立且仅进行计算的指令可以提前执行，但在提交前不得更新架构寄存器。ROB 无法使多拍 DMA 操作具有事务原子性。
+XiangJiang NPU 是单指令流加速器。统一前端按程序顺序取指、译码、重命名和派发；后端允许彼此独立的 Scalar、Vector 和 Matrix 工作乱序执行；统一 ROB 只按程序顺序提交。
 
-## 2. ISA 指令总表
+```text
+Host CPU
+  |-- AXI4-Lite Control
+  |-- AXI4-Full  Memory
+  |
+  +--> ITCM --> Fetch --> Decode --> Rename / Dispatch
+                                      |
+                   +------------------+------------------+
+                   |                  |                  |
+                Scalar RS          Vector RS        Matrix Task
+                   |                  |                  |
+             Scalar FUs          Vector FUs         MU0/MU1/MU2
+                   |                  |                  |
+                   +---------- Completion Network -------+
+                                      |
+                              Result Slots / ROB
+                                      |
+                                Commit / Fault
+                                      |
+                              X/V ARF, Matrix State
 
-XJ-NPU 基线 ISA 共支持 **79 条指令**：33 条 Scalar 指令、36 条 Vector 指令和 10 条 Matrix 指令。下表是架构支持指令的完整清单；每个助记符单独计为一条指令，`.vv/.vx/.vi` 是同一条 Vector 指令的操作数形式，不重复计数。未列出的编码均为非法指令；`NOP/MV/NOT/NEG/J/JR/RET` 等伪指令不计入本表。
+Scalar LSU / Vector LSU / Matrix LSU / Core DMA
+                         |
+                    Unified MemQ
+                         |
+                    DTCM Arbiter
+                         |
+                 4 × 256 KiB DTCM
 
-Vector 架构固定为 `VLMAX=8`，每个向量寄存器包含 8 个 32 位 lane；Matrix 架构固定处理 8×8 tile。Vector 指令的机器编码尚未冻结，表中的“待定义”不影响其架构操作语义，但在编码确定前不能生成可执行机器字。Matrix 的 `unit=0/1/2` 分别选择 BF16 单元 `u0` 和 INT8 单元 `u1/u2`。
+Core DMA <--> External AXI4 Manager <--> System Memory
+```
 
-|序号|执行域|类别|指令|汇编形式|编码/格式|数据类型|操作语义与关键约束|
-|---:|---|---|---|---|---|---|---|
-|1|Scalar|寄存器算术|`ADD`|`ADD rd, rs1, rs2`|R；`opcode=0x33, funct3=000, funct7=0000000`|INT32|`rd = u32(x[rs1] + x[rs2])`；溢出回绕。|
-|2|Scalar|寄存器算术|`SUB`|`SUB rd, rs1, rs2`|R；`opcode=0x33, funct3=000, funct7=0100000`|INT32|`rd = u32(x[rs1] - x[rs2])`；溢出回绕。|
-|3|Scalar|按位运算|`AND`|`AND rd, rs1, rs2`|R；`opcode=0x33, funct3=111, funct7=0000000`|32-bit 位模式|逐位与。|
-|4|Scalar|按位运算|`OR`|`OR rd, rs1, rs2`|R；`opcode=0x33, funct3=110, funct7=0000000`|32-bit 位模式|逐位或。|
-|5|Scalar|按位运算|`XOR`|`XOR rd, rs1, rs2`|R；`opcode=0x33, funct3=100, funct7=0000000`|32-bit 位模式|逐位异或。|
-|6|Scalar|移位|`SLL`|`SLL rd, rs1, rs2`|R；`opcode=0x33, funct3=001, funct7=0000000`|INT32|按 `x[rs2][4:0]` 左移，低位补零。|
-|7|Scalar|移位|`SRL`|`SRL rd, rs1, rs2`|R；`opcode=0x33, funct3=101, funct7=0000000`|UINT32|按 `x[rs2][4:0]` 逻辑右移，高位补零。|
-|8|Scalar|移位|`SRA`|`SRA rd, rs1, rs2`|R；`opcode=0x33, funct3=101, funct7=0100000`|INT32|按 `x[rs2][4:0]` 算术右移，高位补符号位。|
-|9|Scalar|比较|`SLT`|`SLT rd, rs1, rs2`|R；`opcode=0x33, funct3=010, funct7=0000000`|INT32|有符号小于则写入 32 位整数 1，否则写入 0。|
-|10|Scalar|比较|`SLTU`|`SLTU rd, rs1, rs2`|R；`opcode=0x33, funct3=011, funct7=0000000`|UINT32|无符号小于则写入 32 位整数 1，否则写入 0。|
-|11|Scalar|立即数算术|`ADDI`|`ADDI rd, rs1, imm12`|I；`opcode=0x13, funct3=000`|INT32|`rd = u32(x[rs1] + sext32(imm12))`。|
-|12|Scalar|立即数按位|`ANDI`|`ANDI rd, rs1, imm12`|I；`opcode=0x13, funct3=111`|32-bit 位模式|与符号扩展后的立即数逐位与。|
-|13|Scalar|立即数按位|`ORI`|`ORI rd, rs1, imm12`|I；`opcode=0x13, funct3=110`|32-bit 位模式|与符号扩展后的立即数逐位或。|
-|14|Scalar|立即数按位|`XORI`|`XORI rd, rs1, imm12`|I；`opcode=0x13, funct3=100`|32-bit 位模式|与符号扩展后的立即数逐位异或。|
-|15|Scalar|立即数移位|`SLLI`|`SLLI rd, rs1, shamt`|I；`opcode=0x13, funct3=001, inst[31:25]=0000000`|INT32|按 `shamt=inst[24:20]` 左移。|
-|16|Scalar|立即数移位|`SRLI`|`SRLI rd, rs1, shamt`|I；`opcode=0x13, funct3=101, inst[31:25]=0000000`|UINT32|按 `shamt` 逻辑右移。|
-|17|Scalar|立即数移位|`SRAI`|`SRAI rd, rs1, shamt`|I；`opcode=0x13, funct3=101, inst[31:25]=0100000`|INT32|按 `shamt` 算术右移。|
-|18|Scalar|立即数比较|`SLTI`|`SLTI rd, rs1, imm12`|I；`opcode=0x13, funct3=010`|INT32|与符号扩展立即数进行有符号小于比较，结果为 0 或 1。|
-|19|Scalar|立即数比较|`SLTIU`|`SLTIU rd, rs1, imm12`|I；`opcode=0x13, funct3=011`|UINT32|立即数先符号扩展，再按无符号值比较，结果为 0 或 1。|
-|20|Scalar|高位立即数|`LUI`|`LUI rd, imm20`|U；`opcode=0x37`|32-bit 位模式|`rd = {imm20, 12'b0}`。|
-|21|Scalar|PC 相对运算|`AUIPC`|`AUIPC rd, imm20`|U；`opcode=0x17`|32-bit 地址|`rd = u32(PC + {imm20, 12'b0})`。|
-|22|Scalar|加载|`LW`|`LW rd, imm12(rs1)`|I；`opcode=0x03, funct3=010`|32-bit 字|从 `u32(x[rs1]+sext32(imm12))` 加载小端 32-bit 字；要求 4 B 对齐且完整落入 DTCM。|
-|23|Scalar|存储|`SW`|`SW rs2, imm12(rs1)`|S；`opcode=0x23, funct3=010`|32-bit 字|向 `u32(x[rs1]+sext32(S-imm))` 存储 `x[rs2]`；要求 4 B 对齐且完整落入 DTCM。|
-|24|Scalar|条件分支|`BEQ`|`BEQ rs1, rs2, offset`|B；`opcode=0x63, funct3=000`|32-bit 位模式|位模式相等时选择 `PC+offset`，否则选择 `PC+4`。|
-|25|Scalar|条件分支|`BNE`|`BNE rs1, rs2, offset`|B；`opcode=0x63, funct3=001`|32-bit 位模式|位模式不等时选择 `PC+offset`，否则选择 `PC+4`。|
-|26|Scalar|条件分支|`BLT`|`BLT rs1, rs2, offset`|B；`opcode=0x63, funct3=100`|INT32|有符号小于时取分支。|
-|27|Scalar|条件分支|`BGE`|`BGE rs1, rs2, offset`|B；`opcode=0x63, funct3=101`|INT32|有符号大于等于时取分支。|
-|28|Scalar|条件分支|`BLTU`|`BLTU rs1, rs2, offset`|B；`opcode=0x63, funct3=110`|UINT32|无符号小于时取分支。|
-|29|Scalar|条件分支|`BGEU`|`BGEU rs1, rs2, offset`|B；`opcode=0x63, funct3=111`|UINT32|无符号大于等于时取分支。|
-|30|Scalar|跳转|`JAL`|`JAL rd, offset`|J；`opcode=0x6F`|32-bit 地址|跳转到 `u32(PC+offset)`，向 `rd` 写入 `u32(PC+4)`。|
-|31|Scalar|间接跳转|`JALR`|`JALR rd, imm12(rs1)`|I；`opcode=0x67, funct3=000`|32-bit 地址|目标为 `u32(x[rs1]+sext32(imm12)) & 0xFFFFFFFE`，链接值为 `PC+4`。|
-|32|Scalar|屏障|`FENCE`|`FENCE pred, succ`|I；`opcode=0x0F, funct3=000`|控制|保守型全局屏障，覆盖 Scalar、Vector、Matrix 和 DMA 的既有访问。|
-|33|Scalar|终止|`HALT`|`HALT`|仅机器字 `0x0000000B`（`custom-0`）|控制|阻止后续派发；等待更早工作与外部事务排空后正常终止。|
-|34|Vector|INT32 算术|`vadd`|`vadd.vv` / `vadd.vx`|待定义|INT32×8|逐 lane 加法，保留低 32 位。|
-|35|Vector|INT32 算术|`vsub`|`vsub.vv` / `vsub.vx`|待定义|INT32×8|逐 lane 向量减向量或向量减标量。|
-|36|Vector|INT32 算术|`vmul`|`vmul.vv` / `vmul.vx`|待定义|INT32×8|逐 lane 乘法，保留低 32 位。|
-|37|Vector|INT32 算术|`vmax`|`vmax.vv` / `vmax.vx`|待定义|INT32×8|逐 lane 有符号最大值，不是归约。|
-|38|Vector|INT32 算术|`vmin`|`vmin.vv` / `vmin.vx`|待定义|INT32×8|逐 lane 有符号最小值，不是归约。|
-|39|Vector|按位运算|`vand`|`vand.vv` / `vand.vx`|待定义|32-bit 位模式×8|逐 lane 按位与。|
-|40|Vector|按位运算|`vor`|`vor.vv` / `vor.vx`|待定义|32-bit 位模式×8|逐 lane 按位或。|
-|41|Vector|按位运算|`vxor`|`vxor.vv` / `vxor.vx`|待定义|32-bit 位模式×8|逐 lane 按位异或。|
-|42|Vector|移位|`vsll`|`vsll.vv` / `vsll.vx`|待定义|INT32×8|逐 lane 左移；有效移位量位数仍待定义。|
-|43|Vector|移位|`vsrl`|`vsrl.vv` / `vsrl.vx`|待定义|UINT32×8|逐 lane 逻辑右移，高位补零。|
-|44|Vector|移位|`vsra`|`vsra.vv` / `vsra.vx`|待定义|INT32×8|逐 lane 算术右移，高位补符号位。|
-|45|Vector|BF16 算术|`vfadd`|`vfadd.vv` / `vfadd.vx`|待定义|BF16×8|逐 lane BF16 加法；结果写入 lane 低 16 位并清除高 16 位。|
-|46|Vector|BF16 算术|`vfsub`|`vfsub.vv` / `vfsub.vx`|待定义|BF16×8|逐 lane 向量减向量或向量减 BF16 标量。|
-|47|Vector|BF16 算术|`vfmul`|`vfmul.vv` / `vfmul.vx`|待定义|BF16×8|逐 lane BF16 乘法。|
-|48|Vector|BF16 算术|`vfdiv`|`vfdiv.vv` / `vfdiv.vx`|待定义|BF16×8|逐 lane 向量除以向量或 BF16 标量。|
-|49|Vector|BF16 算术|`vfmacc`|`vfmacc.vv` / `vfmacc.vx`|待定义|BF16×8|融合乘加：`vd = vs1×vs2 + old vd`；仅最终结果舍入一次。|
-|50|Vector|BF16 算术|`vfmax`|`vfmax.vv` / `vfmax.vx`|待定义|BF16×8|逐 lane BF16 最大值，不是归约。|
-|51|Vector|BF16 算术|`vfmin`|`vfmin.vv` / `vfmin.vx`|待定义|BF16×8|逐 lane BF16 最小值，不是归约。|
-|52|Vector|格式转换|`vfwcvtbf16.f.f.v`|`vfwcvtbf16.f.f.v vd, vs2`|待定义|BF16×8 → FP32×8|逐 lane 精确拓宽。|
-|53|Vector|格式转换|`vfncvtbf16.f.f.w`|`vfncvtbf16.f.f.w vd, vs2`|待定义|FP32×8 → BF16×8|逐 lane 按 RNE 窄化。|
-|54|Vector|格式转换|`vfcvt.f.x.v`|`vfcvt.f.x.v vd, vs2`|待定义|INT32×8 → FP32×8|逐 lane 整数到浮点数值转换。|
-|55|Vector|格式转换|`vfcvt.x.f.v`|`vfcvt.x.f.v vd, vs2`|待定义|FP32×8 → INT32×8|逐 lane 按 RNE 转换；特殊值和越界行为仍待定义。|
-|56|Vector|元素重排|`vslideup`|`vslideup.vx` / `vslideup.vi`|待定义|32-bit lane×8|元素移向更高 lane，空位以相同类型的零填充。|
-|57|Vector|元素重排|`vslidedown`|`vslidedown.vx` / `vslidedown.vi`|待定义|32-bit lane×8|元素移向更低 lane，空位以相同类型的零填充。|
-|58|Vector|元素重排|`vrgather`|`vrgather.vv`|待定义；可选实现|32-bit lane×8|按索引向量选择源 lane；越界索引行为仍待定义。|
-|59|Vector|归约|`vfredsum`|形式待定义|待定义|浮点向量|浮点求和归约；目的类型、初值、精度与掩码规则仍待定义。|
-|60|Vector|归约|`vfredmax`|形式待定义|待定义|浮点向量|浮点最大值归约；目的类型、初值与掩码规则仍待定义。|
-|61|Vector|整数比较|`vmseq`|`vmseq.vv` / `vmseq.vx`|待定义|INT32×8|逐 lane 相等比较，结果写入目的掩码位。|
-|62|Vector|整数比较|`vmslt`|`vmslt.vv` / `vmslt.vx`|待定义|INT32×8|逐 lane 有符号小于比较。|
-|63|Vector|整数比较|`vmsle`|`vmsle.vv` / `vmsle.vx`|待定义|INT32×8|逐 lane 有符号小于等于比较。|
-|64|Vector|整数比较|`vmsltu`|`vmsltu.vv` / `vmsltu.vx`|待定义|UINT32×8|逐 lane 无符号小于比较。|
-|65|Vector|整数比较|`vmsleu`|`vmsleu.vv` / `vmsleu.vx`|待定义|UINT32×8|逐 lane 无符号小于等于比较。|
-|66|Vector|BF16 比较|`vmfeq`|`vmfeq.vv` / `vmfeq.vx`|待定义|BF16×8|逐 lane 浮点相等比较，而非比较编码整数。|
-|67|Vector|BF16 比较|`vmflt`|`vmflt.vv` / `vmflt.vx`|待定义|BF16×8|逐 lane BF16 小于比较。|
-|68|Vector|BF16 比较|`vmfle`|`vmfle.vv` / `vmfle.vx`|待定义|BF16×8|逐 lane BF16 小于等于比较。|
-|69|Vector|掩码选择|`vmerge.vvm`|`vmerge.vvm vd, vs2, vs1, vm`|待定义|32-bit lane×8|根据低 8 位掩码逐 lane 选择两个源之一；掩码值到源的映射仍待定义。|
-|70|Matrix|模式配置|`MSETMODE`|`MSETMODE unit, mode`|`custom-1`：`opcode=0x2B, funct7=0000000, funct3=unit`|控制|设置 `u1/u2` 的 OS 或 WS；`u0` 只允许 OS；模式切换是控制屏障。|
-|71|Matrix|tile 加载|`MLOAD`|`MLOAD unit, buffer, rsA`|`custom-1`：`opcode=0x2B, funct7=00001bb, funct3=unit`|BF16/INT8/ACC 8×8 tile|从 `x[rsA]` 指向的 DTCM 地址装入 A、B 或 ACC；`bb=00/01/10`。|
-|72|Matrix|tile 存储|`MSTORE`|`MSTORE unit, rsC`|`custom-1`：`opcode=0x2B, funct7=0001000, funct3=unit`|BF16/INT32 8×8 tile|将内部结果 tile 写入 `x[rsC]` 指向的 DTCM 地址。|
-|73|Matrix|矩阵乘法|`MMUL`|`MMUL unit`|`custom-2`：`opcode=0x5B, funct7=0000000, funct3=unit`|8×8 tile|清零 ACC 后计算 `ACC=A×B`；一次操作覆盖 8 个 K 元素。|
-|74|Matrix|矩阵乘累加|`MMACC`|`MMACC unit`|`custom-2`：`opcode=0x5B, funct7=0000001, funct3=unit`|8×8 tile|计算 `ACC=ACC+A×B`，用于跨 K 分块累加。|
-|75|Matrix|逐元素运算|`MEW`|`MEW unit`|`custom-2`：`opcode=0x5B, funct7=0000010, funct3=unit`|8×8 tile|计算 `ACC=A⊙B`。|
-|76|Matrix|转置|`MTRANS`|`MTRANS unit`|`custom-2`：`opcode=0x5B, funct7=0000011, funct3=unit`|8×8 tile|计算 `ACC=Aᵀ`；保持输入元素类型。|
-|77|Matrix|同步|`MWAIT`|`MWAIT unit`|`custom-3`：`opcode=0x7B, funct3=000, unit=inst[31:30]`|控制|等待指定矩阵单元的当前任务完成；`unit=3` 非法。|
-|78|Matrix|同步|`MBARRIER`|`MBARRIER id`|`custom-3`：`opcode=0x7B, funct3=010, id=inst[31:27]`|控制|等待此前 Matrix/DMA 工作完成；`id` 是 5-bit 软件标签。|
-|79|Matrix|屏障|`MFENCE`|`MFENCE`|`custom-3`：`opcode=0x7B, funct3=001`|控制|矩阵显式屏障，与 Scalar `FENCE` 的矩阵覆盖语义等价。|
+### 1.1. 执行域
 
-表中 `u32(v)` 表示保留低 32 位，`sext32(v)` 表示符号扩展到 32 位。Scalar 的 B/J 型偏移按字节计，所选控制目标必须满足 4 B 对齐并位于 ITCM 范围内。Vector 的 `.vx` 标量来自 `x[rs1]`：INT32 操作读取全部 32 位，BF16 操作只读取低 16 位；掩码关闭的算术 lane 保留旧目的值。Matrix 的 BF16 单元使用 FP32 部分和并在最终写回时按 RNE 转为 BF16，INT8 单元使用 INT32 累加和输出。
-
-
-## 3. 存储层次结构
-
-### 3.1. 寄存器堆
-
-标量和向量寄存器的数量与布局见第 1、2 和 6.1 节。读写端口由相应 FU 的实现决定。寄存器 `x0` 只读，不包含时序存储逻辑。
-
-每个矩阵单元都有一对基于寄存器的输入偏斜缓冲区，分别用于 A 和 B；总计三对、六个缓冲区。每对缓冲区采用 8×8 阶梯式/偏斜组织。BF16 缓冲区对中的元素宽 16 位，每个 INT8 缓冲区对中的元素宽 8 位。这些缓冲区只向阵列供数，不接收计算结果；计算结果直接写入 DTCM。
-
-### 3.2. 片上存储器
-
-#### 3.2.1. 指令紧耦合存储器（ITCM）
-
-ITCM 由软件显式加载，不使用缓存命中检测、缺失处理或自动替换。它存储标量、控制流、向量、矩阵和 DMA 指令。权重、激活值和中间结果主要存放在 DTCM 或外部双倍数据速率（DDR）存储器中。
-
-| 参数    | 定义                                                  |
-| ----- | --------------------------------------------------- |
-| 容量与端口 | 256 KiB，采用 32 位单端口同步 SRAM 实现；容纳 65536 个指令字          |
-| 寻址    | PC 按字节寻址；有效地址按 4 字节对齐，右移两位后形成 16 位指令字索引             |
-| 范围    | 内部字节偏移为 `0x00000`–`0x3FFFF`；最后一个有效指令起始地址为 `0x3FFFC` |
-| 时序    | 在时钟边沿接收地址，并在下一周期返回指令；验证响应并丢弃错误路径响应                  |
-| 错误检查  | 在索引截断前检测越界和未对齐地址；禁止静默回绕                             |
-
-程序加载和执行过程如下：
-
-1. NPU 空闲时，主机处理系统（PS）通过高级可扩展接口（AXI）写入程序。
-2. 确认加载完成后，主机通过控制与状态寄存器（CSR）中的 `start` 位启动执行。执行从 `PC=0` 开始。
-3. 执行期间，核心独占 ITCM 端口。主机不得覆盖程序，但可以继续访问 CSR。
-
-复位只初始化控制和流水线状态，不保证清空 ITCM。软件必须在启动执行前加载有效程序。主机 CSR 接口并不意味着实现了 Zicsr。
-
-#### 3.2.2. 数据紧耦合存储器（DTCM）
-
-DTCM 总容量固定为 1 MiB，包含四个相互独立的 256 KiB 存储体，用于保存权重、激活值和中间结果。它采用 64 字节交织，`bank=addr[7:6]`；核心侧零基字节地址范围为 `[0x00000000, 0x00100000)`。每个 bank 包含 4096 条 64 B 行，行索引为 `addr[19:8]`。
-
-|属性|定义|
-|---|---|
-|容量|总计 1 MiB；4 个 bank，每个 bank 256 KiB|
-|每存储体端口|一个独立的 512 位读端口和一个独立的 512 位写端口（1R1W），同一周期内各可处理一次访问|
-|传输大小与写使能|64 B/拍；64 位字节写使能掩码|
-|理论带宽|每个端口每周期接收一拍且不存在存储体冲突时，汇总读带宽和写带宽均为 2048 bit/周期，即 256 B/周期|
-|仲裁|发往不同存储体的请求可以并行处理；同一存储体的多个读请求或多个写请求会串行化，未获授权的请求停顿|
-
-标量域、向量域、三个矩阵单元和 DMA 通过互连访问 DTCM。软件应将并发访问的输入、输出和暂存缓冲区分布到不同存储体。端口峰值带宽并不意味着在第 5 节策略下可获得同等的任务级并发能力。
-
-### 3.3. 直接存储器访问（DMA）
-
-DMA 使用单个 AXI4 主接口以及相互独立的 `Mvin`（外部存储器 → DTCM）和 `Mvout`（DTCM → 外部存储器）引擎。硬件为两个方向提供独立数据通路，但当前调度器不会同时激活两个方向的命令。
-
-每个引擎包含命令队列、地址生成器、突发拆分逻辑和先进先出（FIFO）数据缓冲区。命令指定外部地址、DTCM 地址、传输长度、行数和步长，支持连续传输和二维传输。
-
-- DTCM 侧数据通路宽 512 位。AXI 侧宽度与系统互连匹配，并在需要时进行宽度转换。
-- 按配置的最大突发长度拆分事务。任何突发均不得跨越 4 KiB 边界。
-- 当命令队列已满或数据缓冲区空间不足时，暂停请求接收或发射。发出读请求前必须为返回数据预留空间。
-- `Mvin` 在所有外部读取完成且所有目的字节均成功写入 DTCM 后完成。`Mvout` 在所有源读取完成且每个外部写入均收到成功响应后完成。
-- 命令标识符及完成/错误状态用于依赖跟踪和同步。当未完成响应仍可能与较新命令的响应混淆时，不得复用标识符。
-
-## 4. 乱序执行策略
-
-### 4.1. 标签、年龄与资源分配
-
-每条动态指令拥有一个 ROB 表项。指令年龄通过 `seq` 比较；`tag={ROB_slot, generation}` 标识一个版本并用于依赖匹配。寄存器编号不能代替标签，循环缓冲区槽位索引也不能直接表示年龄。
-
-派发以原子方式执行以下步骤。如果任何所需资源不可用，则停顿当前及后续指令，且不得留下部分分配或 RAT 更新：
-
-1. 识别所有实际源和目的，包括旧目的、掩码、存储数据和配置操作数。非法编码会创建异常表项。
-2. 解析源：`x0` 提供零；未映射的源读取架构寄存器堆；已映射的源获取就绪结果或记录其生产者标签。
-3. 一并分配 ROB 表项、所需 RS 表项或控制记录、目的结果槽位和 MemQ 表项。
-4. 捕获源版本后，为除 `x0` 以外的每个寄存器目的更新 RAT。
-
-无寄存器目的或目的为 `x0` 的指令仍占用 ROB 表项，但既不分配 RAT 映射，也不分配持久结果槽位。它通过带标签的事件报告完成。`LW x0` 必须等待读响应并检查错误，之后才能丢弃数据。
-
-当派发、写回和提交在同一周期访问同一版本时，必须通过广播、就绪结果槽位或提交旁路传递该值。消费者不得错过广播后无限期等待。生产者的结果槽位必须保留到多周期源捕获完成为止。
-
-### 4.2. 后端状态结构
-
-下表描述逻辑记录及其生命周期，但不引入未规定的信号名或二进制编码。容量和字段宽度约束列于第 6.2 节。
-
-|结构|主要字段|更新与释放规则|
+|执行域|职责|边界|
 |---|---|---|
-|ROB|有效位、代号、`seq`、PC、类别、目的、结果槽位/MemQ 引用、执行/广播完成状态、异常、副作用状态|按顺序分配并在写回时更新；提交或故障清理时释放。FU 空闲并不表示指令完成|
-|`RAT-X` / `RAT-V`|有效位、最新未提交 `tag`|派发时更新，不因写回而清除；提交只清除匹配的映射|
-|RS|ROB 标签、操作、立即数、源 `ready/value/tag`、目的类型、掩码、控制值|所有源均已传递且 FU 接收指令后释放；保留 ROB 表项和结果槽位|
-|FU 状态|任务标签、流水线有效位或迭代进度、接收条件、完成缓冲区占用情况|通过握手推进；执行延迟和启动间隔须分别定义|
-|结果缓冲区|标签、类型、32 位或 256 位结果、状态、待接收者状态|在释放前，仲裁并向 ROB 和所有依赖消费者传递结果；存在背压时保持数据稳定|
-|MemQ|标签、`seq`、类别、地址/存储数据依赖、宽度、字节使能、活动通道、任务快照引用、进度、错误|派发时预留；只有队首可以启动。成功时出队；错误会阻止后续表项启动|
-|矩阵任务记录|所有者标签、配置快照、模式、8×8 tile 地址、K 分块位置、部分和有效状态、输出写入进度|获得授权后占用物理资源；所有输出写入或故障清理完成后释放|
-|DMA 任务记录|命令快照、命令/突发标识符（ID）、进度、未完成响应、FIFO 预留、首个错误、部分完成状态|从请求接收起持续跟踪；可能混淆未完成响应时不得复用 ID|
-|控制屏障记录|ROB 标签、种类、条件/配置操作数、下一 PC 或终止状态|分支、配置命令、`FENCE` 和 `HALT` 阻止后续派发；提交或异常处理后释放屏障|
+|Scalar|32-bit 整数、地址生成、分支和控制|不执行 Vector BF16，不绕过 ROB 提交|
+|Vector|8-lane INT32/BF16/FP32 运算、置换、归约和 32 B 访存|Scalar 操作数来自 X Register；无独立 F Register|
+|Matrix|三个 8×8 MU、tile 搬运和内部 ACC|不参与 X/V 重命名；无 Matrix RAT|
+|Core DMA|外部存储器与 DTCM 的二维搬运|命令同步执行，不作为后台已退休任务|
 
-RS、ROB 和结果槽位的容量彼此独立。存在空闲 ROB 表项并不表示存在可用结果槽位。无寄存器结果的存储指令仍占用 ROB 和 MemQ 表项。
+### 1.2. 流水阶段
 
-### 4.3. 发射、完成与广播
-
-只有当所有必需的源均已就绪、FU 能够接收且完成缓冲区有容量时，指令才能发射。每个 FU 选择最老的就绪候选。操作数尚不可用的较老指令不会阻塞其他可执行指令；共享电路和端口仍需仲裁。
-
-基线设计只有一条逻辑公共数据总线（CDB），每周期至多传送一个结果，最大宽度为 256 位。标量结果使用低 32 位并携带类型信息。同一周期内由多个 FU 完成的结果会先被缓冲，再以最老就绪优先方式仲裁广播；未选中的结果继续保留在缓冲区中。
-
-广播会写入 ROB 结果槽位，并唤醒 RS、MemQ、分支记录和配置记录中的消费者。它不会直接更新架构寄存器或 RAT。即使生产者的映射已被具有写后写（WAW）依赖的较年轻写入者取代，该生产者仍必须广播并提交。向量结果必须将活动通道的新值与掩码关闭通道的旧值合并；不对外暴露部分就绪状态。
-
-无寄存器结果的指令通过带标签事件完成。与数据写回共用端口的完成和错误事件必须经过缓冲和仲裁。具有无效标签或代号不匹配的响应会被丢弃。
-
-### 4.4. 提交与版本回收
-
-只有 ROB 头部可以提交。若其存在异常，则应用第 4.7 节的故障约束，而不是执行正常提交。如果执行、必要广播或存储器完成确认仍未结束，头部将继续等待；较年轻指令不能越过它提交。
-
-正常结果会更新架构寄存器堆；只有对 `x0` 的写入会被丢弃。仅当 RAT 映射仍与当前提交标签匹配时才清除它，否则保留较年轻写入者的映射。为保留精确异常所需的较老版本，提交结果仍必须更新架构寄存器。配置命令、屏障、控制转移和存储器操作在各自的 ROB 头部动作完成后释放资源。
-
-只有在所有已登记消费者均捕获结果后，结果槽位才能回收。提交后派发的消费者从架构寄存器堆或更新后的 RAT 映射读取。ROB 槽位复用需要代号检查；在代号回绕之前，必须排空可能产生歧义的响应。清空队列不会阻止 FU 或外部总线返回响应。
-
-### 4.5. 分支与跳转
-
-本设计没有方向预测器、分支目标缓冲区（BTB）或返回地址预测栈。控制转移按以下方式处理：
-
-1. 识别条件分支、`JAL` 或 `JALR` 时，保留本指令的 PC、源值/标签和立即数，并按顺序分配 ROB 表项。停止后续取指和派发，并使较年轻的预取响应失效。ROB 已满时，绝不能允许分支后的指令继续推进。
-2. 更早的指令继续执行和提交。控制转移指令到达 ROB 头部且其源就绪后，由 S-BRU 解析下一 PC。
-3. 只检查选定的下一地址是否按 4 字节对齐以及是否在 ITCM 范围内。未跳转分支的编码目标不会引起目标故障。B 型和 J 型立即数的 2 字节编码粒度并不保证地址对齐；`JALR` 清除位 0 后，仍必须检查位 1。
-4. 若发生目标故障，则记录异常且不提交链接值。否则提交链接结果，并从已解析的下一 PC 恢复取指。
-
-每次控制转移都要等待此前工作排空，包括 DMA 和矩阵任务。因此，循环分支开销不只取决于比较器延迟。
-
-### 4.6. 存储器屏障、配置与正常终止
-
-以下三类操作均按顺序分配 ROB 表项，在被识别时阻止后续派发，并在 ROB 头部执行动作：
-
-|操作|ROB 头部动作与完成条件|
-|---|---|
-|`FENCE`|等待更早指令提交，且更早的 MemQ 表项和外部事务完成；提交后从 `PC+4` 恢复执行。排序可以强于 `pred/succ` 的要求，但不能更弱|
-|配置命令|等待源操作数，更新指定字段，提交并恢复执行；操作数可以由标量运算、加载或向量归约产生|
-|`HALT`|等待更早指令提交、无活动 MemQ 表项，且 FU、结果缓冲区和外部事务中的未完成工作全部结束；随后提交并将本次运行标记为完成。不写普通寄存器，也不执行复位|
-
-`HALT` 只在有效指令流中生效。预取到的零字不得立即停止执行，错误路径上的 `HALT` 必须仍可取消。
-
-### 4.7. 异常与故障处理约束
-
-本节汇总源文档已经确立的故障边界，不定义新的异常编码、主机寄存器或恢复协议。
-
-- **记录与提交：** 非法编码会创建 ROB 异常表项。执行错误和存储器错误按标签更新对应状态。异常到达 ROB 头部时调用故障处理；较年轻指令不能越过它提交。
-- **错误事件传递：** 与结果写回共用端口的错误事件需要缓冲和仲裁。端口繁忙不得导致错误事件丢失。具有无效标签或代号不匹配的响应会被丢弃。
-- **存储器访问阻塞：** MemQ 错误会阻止后续表项启动。DMA 记录首个错误、部分完成状态和未完成响应；失败任务不得作为成功任务出队。
-- **未完成事务的结束：** 清空内部队列不会取消外部事务。任务记录和响应标识符仍须遵守第 4.2 和 4.4 节中的释放和复用规则。
-- **部分副作用：** 顺序 ROB 提交不能使多拍 DMA 操作具有事务原子性。不得假定已完成的存储器写入会回滚。
-
-取指和选定控制转移目标的检查见第 3.2.1 和 4.5 节。故障报告字段、内部清理和排空顺序、主机确认及重启条件仍未规定；参见第 6.3 节。
-
-## 5. 存储器访问策略
-
-### 5.1. 入队、激活与完成
-
-标量 `LW/SW`、向量加载和存储、完整矩阵任务以及 DMA 执行命令在派发时按程序顺序预留 MemQ 表项，无需等待地址就绪。ITCM 取指不进入 MemQ。无存储器副作用的配置命令由控制屏障管理。
-
-同一时刻只能有一个表项处于活动状态。较年轻表项不能绕过尚未就绪的队首表项。本设计不执行地址推测、加载绕过较老存储、存储器访问重放或存储到加载转发。单个表项可以利用存储体级并行、将传输拆成多拍并流水化突发，但后续表项必须等待前一表项完全完成。
-
-|操作|激活条件|成功出队和 ROB 完成条件|
+|阶段|职责|是否改变已提交架构状态|
 |---|---|---|
-|标量 `LW`、向量加载|位于 MemQ 队首；所需地址/掩码输入和返回数据槽位已就绪；仅限无读取副作用的 DTCM 读取|所有活动数据均已返回、合并、写入 ROB 并被消费者接收；架构寄存器更新仍须等待提交|
-|标量 `SW`、向量存储|同时位于 MemQ 队首和 ROB 头部；地址及存储数据就绪；预检查通过|所有活动字节均已被目标 SRAM 接收，并到达可被后续读取观察到的完成点；仅进入请求 FIFO 并不足够|
-|完整矩阵任务|同时位于 MemQ 队首和 ROB 头部；配置和阵列资源就绪|所有输入处理和 K 分块计算完成，所有输出写入 DTCM，且无任务错误|
-|DMA `Mvin`|同时位于 MemQ 队首和 ROB 头部；命令及返回缓冲区有效|所有外部读取完成，且所有目的 DTCM 字节均成功写入|
-|DMA `Mvout`|同时位于 MemQ 队首和 ROB 头部；命令和发送资源有效|所有源读取完成，且每次外部写入均收到成功响应|
+|Fetch|从同步 ITCM 取指，绑定 PC 和 epoch|否|
+|Decode|严格检查机器编码，生成源/目的/FU/访存元数据|否|
+|Rename/Dispatch|捕获源版本，原子分配 ROB、结果槽、RS/MemQ|否|
+|Issue|选择最老的就绪候选，并与目标 FU 握手|否|
+|Execute|计算或执行多拍任务|否|
+|Complete|写结果槽、记录异常、唤醒消费者|否|
+|Commit|ROB Head 发布寄存器/Matrix/DMA 配置，或授权不可逆操作|是|
+|Retire|提交事务完成后释放资源|不增加新副作用|
 
-不可逆操作遵循以下顺序：到达头部 → 获得启动授权 → 等待完成 → 提交。获得授权并不等同于成功提交。若等待提交后才启动，会造成完成和提交互相等待的死锁。
+取指、派发和提交宽度均为每周期至多一条指令。不同 FU 可以在同周期各自发射一条就绪操作，因此“顺序单发射前端”不等于“后端每周期只能执行一个 FU”。
 
-DTCM 加载可以在到达 ROB 头部前执行，并向较年轻的纯计算指令提供数据，因为它读取的是没有读取副作用的普通 SRAM。该规则不得自动套用到未来的设备读取。普通整数地址先按整数寄存器宽度（XLEN，32 位）回绕，再进行验证；DMA 和矩阵地址范围生成必须使用足够宽的运算，以检测长度和步长溢出。
+## 2. 前端与控制流
 
-### 5.2. 数据依赖与避免死锁约束
+### 2.1. Fetch
 
-- 存储数据、掩码、旧目的以及矩阵/DMA 参数使用派发时捕获的版本。执行阶段不得重新读取此后可能已被覆盖的架构寄存器。
-- 全部被掩码关闭的存储器操作不发出 SRAM 请求，但仍按顺序完成。掩码加载保留旧目的，不能将其视为无目的指令。
-- MemQ 队首的寄存器依赖必须来自较老生产者。矩阵输入必须来自更早的已完成写入或当前任务执行的访问；任务不能等待较晚 MemQ 表项提供数据。
-- 尚未启动的较年轻表项只能占用命令记录。它们不得占用队首表项所需的阵列、偏斜缓冲区、返回缓冲区或 DTCM 服务路径。
-- 多个矩阵/DMA 任务不能作为后台工作提前启动。`FENCE` 和 `HALT` 仍必须检查未完成的外部事务，而不能只依赖队列有效位。
+ITCM 是 32-bit 单端口同步 SRAM：请求在周期 N 接受，指令在 N+1 返回。每个响应绑定请求 PC 和 epoch；重定向、故障或清空后，旧 epoch 响应必须丢弃。
 
-### 5.3. 有效并发限制
+在截断 SRAM index 前检查 PC：
 
-|场景|当前策略|
-|---|---|
-|S-ALU、不同的向量 FU，以及一个活动存储器表项内部的计算|可以并发执行|
-|一个任务内的多个存储体请求，或一个 DMA 命令内的多个未完成突发|允许|
-|两个独立的活动加载表项，或加载绕过较老存储|禁止|
-|DMA 命令与另一个矩阵/DMA 存储器表项同时活动|禁止|
-|三个完整矩阵任务在三个阵列上同时运行|禁止|
-|长 DMA 操作占据 ROB 头部时，较年轻的独立纯计算指令|可以执行并缓冲结果，但不能提交；当 ROB 表项、RS 表项或结果槽位耗尽时前端停顿|
+- 4 B 对齐；
+- 位于 `[0x00000000,0x00040000)`；
+- 不允许地址回绕形成 ITCM 别名。
 
-四存储体峰值带宽、双向 DMA 数据通路和三个阵列描述的是硬件能力，并不表示当前的有序存储器策略能够同时利用所有这些并发能力。
+### 2.2. 无预测控制流
 
-## 6. 参数汇总
+本设计没有方向预测器、BTB 或返回地址栈。识别 `BEQ/BNE/BLT/BGE/BLTU/BGEU/JAL/JALR` 后：
 
-### 6.1. 固定架构配置
+1. 当前控制转移按顺序分配 ROB 和控制记录。
+2. 阻止更年轻指令继续派发，并使年轻预取响应失效。
+3. 更老指令继续执行和提交。
+4. 控制转移成为 ROB Head、源就绪且更早副作用排空后，由 S-BRU 解析。
+5. 成功时提交链接值并重定向；失败时进入精确故障流程。
 
-下表汇总配置；详细语义和边界见引用章节。
+不需要分支 RAT checkpoint，因为未在未解析分支之后建立年轻架构工作。
 
-|属性|配置|定义位置|
+### 2.3. 派发屏障
+
+以下操作识别后阻止年轻派发，直到自身提交或故障：
+
+- 分支和跳转；
+- `FENCE/MFENCE/MBARRIER/MWAIT`；
+- `MSETMODE`、DMA 配置；
+- `HALT`；
+- 需要全局排空的控制操作。
+
+## 3. 重命名与依赖管理
+
+### 3.1. 架构和推测状态
+
+|状态|已提交副本|推测/版本化副本|
 |---|---|---|
-|指令流 / PC|单指令流 / 32 位 PC|第 1 节|
-|指令长度 / 取指对齐|32 位 / 4 B|第 2、3.2.1 节|
-|标量寄存器|32×32 位；`x0` 恒为零；无独立浮点寄存器堆|第 1、3.1 节|
-|向量寄存器|32×256 位；每个寄存器含八个 32 位通道；BF16 占据低 16 位|第 2 节|
-|取指 / 派发 / 提交|均为每周期至多一条指令|第 1 节|
-|全局广播|每周期一个结果，最大 256 位|第 4.3 节|
-|分支策略|无预测；等待更早指令提交|第 4.5 节|
-|ITCM|256 KiB，32 位单端口同步 SRAM；65536 个指令字；下一周期返回响应|第 3.2.1 节|
-|DTCM|总计 1 MiB；四个 256 KiB 存储体，每个配有 512 位 1R1W 端口；64 字节交织，`bank=addr[7:6]`；理论读写带宽各为 256 B/周期|第 3.2.2 节|
-|矩阵阵列|一个 BF16 阵列和两个 INT8 阵列，每个阵列含 8×8 个 PE；BF16 使用 OS，INT8 支持 OS/WS|第 2 节|
-|矩阵累加 / 输出|BF16 输入：FP32/BF16；INT8 输入：INT32/INT32；在一个任务内跨 K 维分块保留部分和|第 2 节|
-|活动 MemQ 表项|至多一个；存储、矩阵任务和 DMA 还需要 ROB 头部授权|第 5.1 节|
-|DMA|一个 AXI4 主接口及 `Mvin`/`Mvout` 数据通路；两个方向的命令不同时激活|第 3.3、5.3 节|
-|舍入 / 浮点控制|固定 RNE；无可写的 `frm/fcsr`|第 2 节|
+|X Register|X ARF|RAT-X + Scalar Result Slots|
+|V Register|V ARF|RAT-V + 256-bit Vector Result Slots|
+|Matrix|各 MU 已提交 A/B/ACC/mode|带 ROBTag 的 staging/working|
+|DMA 配置|已提交 shape/stride 和有效位|ROB 中的配置 effect|
+|存储器|DTCM/外部存储器|MemQ、任务记录和 FIFO|
 
-### 6.2. 由实现定义的参数
+X/V 使用独立 RAT；Matrix 不设置 RAT。已提交 ARF 保存精确状态，结果槽保存未提交版本。
 
-这些参数影响面积、时序和平台映射，但不会改变已规定的语义。没有寄存器传输级（RTL）或综合证据时不得虚构其值。硬件和软件必须使用同一份生成配置。
+### 3.2. 原子 Rename/Dispatch
+
+派发必须先解析所有显式和隐式源，再更新目的映射。源包括：
+
+- X/V 普通源；
+- 旧 Vector 目的；
+- 旧 `v0` 掩码；
+- Store 数据；
+- Matrix/DMA 地址和配置参数；
+- `vfmacc` 旧目的。
+
+源解析规则：
+
+|情况|动作|
+|---|---|
+|`x0`|直接提供零|
+|RAT 无映射|捕获 ARF 值|
+|RAT 映射且结果已就绪|捕获结果槽值|
+|RAT 映射但未就绪|保存完整生产者 tag 并登记消费者|
+
+一条指令所需的 ROB、结果槽、RS/控制记录和 MemQ 必须原子分配。任一资源不足时整条指令等待，不得留下部分 RAT 更新或资源泄漏。
+
+### 3.3. 标签与年龄
+
+- `tag={ROB_slot,generation}` 标识动态指令和结果版本。
+- `seq` 表示程序年龄，不能用循环 slot 直接比较年龄。
+- FU、结果槽、MemQ、Matrix/DMA 任务和外部响应均携带完整 tag。
+- 返回时必须验证 slot、generation 和 owner；不匹配的迟到响应丢弃。
+- generation/seq 即将回绕时停止分配，排空所有可能返回的响应后再重置域。
+
+### 3.4. RAT 和结果槽回收
+
+提交旧生产者时，仅当 RAT 仍同时匹配其 tag 和结果槽编号才清除映射；较年轻的 WAW 映射必须保留。
+
+结果槽只有在以下条件全部满足后才能回收：
+
+- 生产者已经提交或故障清理；
+- 所有已登记消费者已捕获结果或撤销登记；
+- 恢复流程不再需要该值。
+
+原型不允许同一周期释放并立即重新分配同一结果槽。
+
+## 4. ROB、RS 与完成网络
+
+### 4.1. ROB 表项
+
+逻辑 ROB Entry 至少包含：
+
+```text
+identity: valid, slot, generation, seq, pc, inst
+operation: domain, opcode, destination metadata
+result: scalar/vector result slot reference
+memory: MemQ/task reference, authorization, progress
+matrix/dma effects: unit/config snapshot and publish state
+completion: uop count/bitmap, completion-only event
+fault: valid, cause, address, detail
+```
+
+每条成功派发的动态指令恰有一个 ROB Entry；多拍执行仍只对应一个架构指令。
+
+### 4.2. 保留站
+
+RS 保存：
+
+- ROBTag 和 seq；
+- 操作码、立即数和控制信息；
+- 每个源的 `ready/value/tag`；
+- 目的结果槽；
+- 掩码和旧目的。
+
+每个 FU 从自己的候选集中选择 `seq` 最小的就绪项。较老但源未就绪的操作不阻止其他 FU 发射较年轻的独立计算。
+
+### 4.3. 完成网络
+
+基线只有一条逻辑 CDB，每周期至多广播一个结果，最大宽度 256 bit。Scalar 结果使用低 32 bit。
+
+```text
+Completion = {
+  tag, seq, destination_kind,
+  scalar_data[31:0] or vector_data[255:0],
+  exception_valid, cause, value,
+  completion_only
+}
+```
+
+多个 FU 同周期完成时，响应先进入各 FU 输出保持缓冲，再由完成网络选择最老响应。未获选择的响应保持稳定，不能覆盖或丢失。
+
+广播同时：
+
+- 写对应结果槽；
+- 更新 ROB 完成/故障状态；
+- 唤醒 RS、MemQ 和控制记录。
+
+广播不直接写 ARF、RAT、DTCM 或已提交 Matrix 状态。
+
+### 4.4. 提交
+
+只有 ROB Head 可以提交。普通寄存器结果在提交时写 ARF；Matrix working 和 DMA 配置在提交时发布；Store、MSTORE 和 DMA 写入则在 Head 获得启动授权，并在实际事务完成后退休。
+
+“授权”不等于“成功完成”。若必须等到操作完成才授权，将形成提交和执行互相等待的死锁。
+
+## 5. 功能单元
+
+### 5.1. FU 组成
+
+|执行资源|数量|职责|
+|---|---:|---|
+|S-ALU|1|Scalar 算术、逻辑、比较、移位、LUI/AUIPC|
+|S-BRU|1|分支条件、目标、链接值和目标检查|
+|S-AGU|1|LW/SW 地址生成、对齐和范围预检查|
+|V-IALU|1 组|8-lane INT32 算术、逻辑、移位和比较|
+|V-IMUL|1 组|8-lane INT32 乘法|
+|V-BFPU|1 组|BF16 算术/FMA/比较和四类转换|
+|V-BFDIV|1|迭代式 BF16 除法|
+|V-PERM/RED|1|slide、gather、merge 和固定顺序归约|
+|Scalar/Vector LSU|1 个共享顺序接口|LW/SW 和 VLD/VST|
+|MU0|1|BF16 8×8 Matrix Unit，FP32 ACC|
+|MU1/MU2|各 1|signed INT8 8×8 Matrix Unit，INT32 ACC|
+|Matrix LSU|1|MLOAD/MSTORE tile 搬运|
+|DMA Engine|1|二维地址生成、burst 拆分和数据搬运|
+
+`FENCE/HALT/MSETMODE/MWAIT/MBARRIER/MFENCE` 由控制记录和 ROB Head 处理，不发送到虚构的普通 ALU。
+
+### 5.2. FU 接口原则
+
+- FU 只使用派发/发射时捕获的源，不重新读取 ARF。
+- 请求和响应携带完整 ROBTag。
+- ISA 不暴露固定执行延迟；`latency` 和启动间隔 `II` 是实现参数。
+- 发射前必须确保输出保持寄存器或 FIFO 有空间。
+- 响应受阻时 tag、data、fault 必须稳定。
+- Vector FU 只广播完整 256-bit 结果，不暴露部分 lane ready。
+- 被掩码关闭的 lane 不启动可能产生特殊结果的运算。
+
+### 5.3. Scalar 路径
+
+S-ALU 接收两个 32-bit 源、立即数、PC 和 ROBTag。当前 Scalar RTL 的 ALU 为单周期、`II=1`，但这不是软件可见保证。
+
+S-BRU 独立于 S-ALU，只在控制转移成为 ROB Head 时执行。它输出所选下一 PC、链接值、目标故障和重定向信息。
+
+S-AGU 与 LSU 分离。地址就绪不等于访存完成；SW 数据必须使用派发时捕获的版本。
+
+### 5.4. Vector 路径
+
+Vector 数据通路逻辑宽度为 256 bit。物理实现可以采用 8 路并行 lane，也可以分时执行，但必须保持单条 Vector 指令结果原子性。
+
+- V-IALU 和 V-IMUL 分离，避免乘法路径限制逻辑操作时序。
+- V-BFPU 统一实现分类、规格化和 RNE；不同操作不得依赖不同 IP 的默认特殊值行为。
+- V-BFDIV 可逐 lane 迭代，但一个请求占用单元直到全部启用 lane 完成。
+- V-PERM/RED 使用 8×8 选择网络或等价结构；归约顺序必须符合 XJ-ISA。
+
+## 6. Matrix 子系统
+
+### 6.1. 状态划分
+
+每个 MU 包含：
+
+- 已提交 A/B 输入；
+- 已提交 ACC 和 mode；
+- 输入有效位；
+- 带 owner ROBTag 的 staging/working；
+- 8×8 PE 阵列和任务控制器。
+
+```text
+Committed A/B/ACC/mode
+          |
+          +-- snapshot --> Working(owner ROBTag)
+          |                    |
+          +<---- Commit publish+
+
+DTCM --> Matrix LSU --> Staging(owner ROBTag) --> Commit publish
+```
+
+### 6.2. Matrix 指令生命周期
+
+|指令|执行方式|
+|---|---|
+|MLOAD|ROB Head + MemQ Head 启动；完整 tile 进入 staging；正常提交时发布|
+|MMUL/MMACC/MEW/MTRANS|ROB Head 启动；快照已提交状态；working 完成后提交 ACC|
+|MSTORE|ROB Head + MemQ Head 授权；快照已提交 ACC；逐拍写 DTCM|
+|MSETMODE|ROB Head 等待目标 MU 空闲后更新 mode|
+|MWAIT|观察指定 MU 的任务和完成记录|
+|MBARRIER/MFENCE|在 ROB Head 检查全局排空条件|
+
+每个 MU 同时至多拥有一个 working task。三个阵列物理独立，但由于 Matrix writer 只在 ROB Head 启动，基线不承诺三个完整 Matrix task 并发。
+
+### 6.3. 精确状态
+
+- MLOAD 失败时丢弃 staging，不改变已提交状态。
+- Matrix compute 发生状态故障时丢弃 working。
+- compute 正常完成且 owner tag 匹配后，只有提交才发布 ACC。
+- MSTORE 是不可逆多拍写；已被 SRAM 接受的字节不回滚。
+- Flush 可丢弃未发布 staging/working，但不能取消已接受的 DTCM 请求。
+
+数值和 tile 布局由 XJ-ISA 第 5 节定义。
+
+## 7. 存储层次
+
+### 7.1. ITCM
+
+|属性|配置|
+|---|---|
+|容量|256 KiB|
+|组织|65536×32-bit 单端口同步 SRAM|
+|核心地址|`[0x00000000,0x00040000)`|
+|时序|请求 N 接受，N+1 返回|
+|复位|不清 SRAM|
+
+Core 运行时独占 ITCM；Host 只在 Core idle 时装载或回读。
+
+### 7.2. DTCM
+
+|属性|配置|
+|---|---|
+|总容量|1 MiB|
+|Bank|4×256 KiB|
+|每 bank|4096×512 bit，1R1W|
+|交织|64 B；`bank=addr[7:6]`|
+|行索引|`addr[19:8]`|
+|行内 byte|`addr[5:0]`|
+|写使能|64-bit byte mask|
+|核心地址|`[0x00000000,0x00100000)`|
+|复位|不清 SRAM|
+
+物理峰值读、写带宽各为 4×64 B/cycle，但实际吞吐受 MemQ、bank 冲突、适配器和仲裁限制。
+
+同一 bank 的多个同向访问串行化；同一行读写也必须由仲裁器明确排序，不能依赖 SRAM macro 的未定义 read-during-write 行为。
+
+### 7.3. 地址检查原则
+
+- Scalar/Vector 有效地址按 XJ-ISA 的 32-bit 运算形成，再检查对齐和范围。
+- Matrix/DMA 多拍范围使用扩展精度中间值，禁止回绕。
+- 所有多拍访问在首个请求前完成完整范围预检查。
+- 未对齐优先于范围错误。
+- 检查必须发生在 SRAM index 截断之前。
+
+## 8. MemQ 与存储顺序
+
+### 8.1. 入队
+
+以下指令在派发时按程序顺序预留 MemQ：
+
+- `LW/SW`；
+- `VLD/VST`；
+- `MLOAD/MSTORE`；
+- `MVIN/MVOUT`。
+
+纯 Matrix compute 和无存储器副作用的配置操作不进入 MemQ。
+
+### 8.2. 单活动表项
+
+同一时刻至多一个 MemQ 表项处于活动状态。年轻表项不能绕过未就绪的队首；不实现：
+
+- 地址推测；
+- Load 绕过更老 Store；
+- Store-to-Load forwarding；
+- memory replay；
+- 多个独立活动 Load。
+
+DTCM Load 可以在到达 ROB Head 前执行，因为 DTCM 读取无设备副作用；Store、MLOAD/MSTORE 和 MVIN/MVOUT 必须在 ROB Head 获得授权。
+
+### 8.3. 激活与完成
+
+|操作|激活条件|完成条件|
+|---|---|---|
+|LW/VLD|MemQ Head、地址和返回槽就绪、预检查通过|数据完整返回并写结果槽|
+|SW/VST|MemQ Head + ROB Head、数据就绪、预检查通过|全部字节达到 SRAM 完成点|
+|MLOAD|MemQ Head + ROB Head、staging 可用|tile 完整返回；提交时发布|
+|MSTORE|MemQ Head + ROB Head、ACC 有效|全部 tile 字节完成|
+|MVIN|MemQ Head + ROB Head、全命令预检查/缓冲预留完成|外部读成功且 DTCM 写完成|
+|MVOUT|MemQ Head + ROB Head、全命令预检查/发送资源完成|外部写全部收到成功响应|
+
+## 9. Core DMA 与外部 AXI
+
+### 9.1. DMA 结构
+
+DMA 包含：
+
+- 已提交 shape/stride 配置及有效位；
+- MVIN 和 MVOUT 逻辑数据路径；
+- 64-bit/65-bit 扩展地址预检查；
+- 行地址生成器；
+- 4 KiB/burst 拆分器；
+- AXI ID 和响应跟踪；
+- 数据 FIFO 和 DTCM 宽度转换。
+
+两个方向不会同时激活。
+
+### 9.2. Burst 约束
+
+- 外部地址宽度固定 32 bit。
+- 单 burst 不超过 256 B，且不得跨越 4 KiB。
+- 最多 4 个同方向 burst 在途。
+- 发出读请求前预留完整返回空间。
+- 行严格按软件顺序执行；允许零 stride 和重叠行。
+- MVIN 验证完整 burst 后按命令顺序写 DTCM。
+- MVOUT 已接受 AW 后必须完成所有 W beat 并接收 B。
+
+### 9.3. AXI 错误
+
+普通 AXI 错误：停止发新 burst，排空已接受事务，记录首个错误和进度；此前成功写入的数据不回滚。
+
+如果 ID、LAST 或响应归属被破坏，无法证明剩余响应的所有者，则进入 `BUS_POISONED`：
+
+- 保持 BUSY 和 owner；
+- 不接受 ACK、START 或 Host SRAM 访问；
+- 不伪造安全排空；
+- 只能平台复位恢复。
+
+## 10. Host 接口与生命周期
+
+### 10.1. 接口
+
+|接口|作用|
+|---|---|
+|AXI4-Lite Control Slave|START/ACK、状态、故障和配置查询|
+|AXI4-Full Memory Slave|Core idle 时装载/回读 ITCM/DTCM|
+|AXI4 Manager|Core DMA 访问外部存储器|
+
+Host SRAM 窗口：
+
+|Host 地址|目标|
+|---|---|
+|`[0x00000000,0x00040000)`|ITCM|
+|`[0x10000000,0x10100000)`|DTCM|
+|其他|`SLVERR`|
+
+Host 地址与 Core 零基本地地址不是同一命名空间。
+
+### 10.2. 生命周期
+
+```text
+RESET -> IDLE
+IDLE --START--> RUNNING
+RUNNING --HALT/drain--> DONE --ACK--> IDLE
+RUNNING --fault/drain--> FAULT --ACK--> IDLE
+RUNNING --protocol poison--> BUS_POISONED --platform reset--> IDLE
+```
+
+- START 要求 Core 和 Host Memory 接口完全空闲。
+- 每次 START 从 PC=0 开始。
+- ACK 清终止/故障/进度，不清寄存器、Matrix 状态、DMA 配置和 SRAM。
+- Core 运行时 Host 不能修改 ITCM/DTCM。
+- Host 必须自行处理 CPU cache 与外部 DMA 的一致性。
+
+### 10.3. Control MMIO
+
+接口版本 1（当前 Scalar-only RTL）：
+
+|偏移|名称|定义|
+|---:|---|---|
+|`0x00`|CONTROL|写 bit0 START、bit1 ACK|
+|`0x04`|STATUS|bit0 BUSY、bit1 DONE、bit2 FAULT|
+|`0x08`|FAULT_PC|故障指令 PC|
+|`0x0C`|FAULT_INST|故障机器字|
+|`0x10`|FAULT_CAUSE|XJ-ISA 本地故障码|
+|`0x14`|FAULT_ADDR|故障地址/数据|
+|`0x18`|ITCM_BYTES|ITCM 容量|
+|`0x1C`|DTCM_BYTES|DTCM 容量|
+|`0x20`|CONFIG_ROB|ROB 表项数|
+|`0x24`|CONFIG_XRES|Scalar Result Slot 数|
+|`0x28`|CONFIG_MEMQ|MemQ 表项数|
+|`0x2C`|CONFIG_ISSUE|Scalar Issue 深度|
+|`0x30`|VERSION|接口版本|
+|`0x100+4*n`|XREG[n]|已提交 X Register，只读|
+
+完整目标实现使用接口版本 2，并增加：
+
+|偏移|名称|定义|
+|---:|---|---|
+|`0x34`|FAULT_DETAIL|域、域内原因和索引|
+|`0x38`|DMA_ROW_BYTES|已提交 row_bytes|
+|`0x3C`|DMA_ROWS|已提交 rows|
+|`0x40`|DMA_EXT_STRIDE|已提交 external_stride|
+|`0x44`|DMA_LOCAL_STRIDE|已提交 local_stride|
+|`0x48`|DMA_BYTES_DONE|已确认成功字节数|
+|`0x4C`|DMA_ROWS_DONE|完整成功行数|
+|`0x50`|DMA_STATUS|ACTIVE/DIRECTION/ERROR/BUS_POISONED|
+
+## 11. 精确故障与清空
+
+故障由 FU、取指、LSU、Matrix 或 DMA 生成，先带 tag 写入对应 ROB Entry。只有故障指令成为 ROB Head 时才改变全局运行状态。
+
+普通故障流程：
+
+1. 锁存 `FAULT_PC/INST/CAUSE/ADDR/DETAIL`。
+2. 停止取指、派发和新的 FU/存储器启动。
+3. 排空已被 SRAM/AXI 接受的请求和 FU 输出缓冲。
+4. 丢弃故障指令及更年轻的 RS、RAT、结果槽、ROB 和 Matrix working。
+5. 保留已提交 ARF/Matrix/DMA 配置和已授权的部分存储器副作用。
+6. 安全排空后清 BUSY、置 FAULT，等待 Host ACK。
+
+纯计算 FU 可以在 Flush 后继续运行，并在出口因 tag 失配被丢弃；已经接受的 SRAM/AXI 事务不能被 Flush 取消。
+
+## 12. 参数与正确性不变量
+
+### 12.1. 固定配置
+
+|参数|值|
+|---|---|
+|指令/PC|32 bit / 32 bit|
+|取指/派发/提交|各 1 条/cycle 上限|
+|X Register|32×32 bit|
+|V Register|32×256 bit|
+|Matrix|3×8×8 PE|
+|ITCM|256 KiB|
+|DTCM|1 MiB，4×256 KiB|
+|CDB|1×256 bit/cycle|
+|活动 MemQ|最多 1|
+|分支预测|无|
+
+### 12.2. 实现参数
 
 |参数|约束|
 |---|---|
-|`N_ROB`|必须容纳当前派发分配；扩大窗口不会增加提交宽度|
-|`N_RS[fu]`|每个已实现 FU 必须至少有一个可用候选记录|
-|`N_XRES/N_VRES`|标量/向量结果槽位分别保存 32 位/256 位值，并与 ROB 表项原子分配|
-|`N_MEMQ`|至少为一；增加队列深度不会增加活动表项数量|
-|`N_RESULT[fu]`|发射必须保证结果能够被缓冲或施加背压|
-|`G_tag/W_seq`|代号/序号宽度；在回绕前排空未完成响应，或保证年龄比较无歧义|
-|`A_AXI/W_AXI`|外部地址/数据宽度；配置字段、宽度转换、写选通（`WSTRB`）和驱动程序必须一致|
-|AXI 最大突发长度 / 未完成事务数|突发不得跨越 4 KiB 边界；FIFO 和响应 ID 容量必须覆盖已接收事务|
-|`L_fu/II_fu`|分别规定操作延迟和启动间隔；迭代除法和矩阵任务不得建模为具有单周期吞吐率|
-|主机存储器映射输入/输出（MMIO）窗口|ITCM、DTCM 和控制区不得重叠；不得在未调整的情况下复用早期容量配置中的偏移|
+|`N_ROB`|扩大窗口不改变单提交宽度|
+|`N_RS[fu]`|每个已实现 FU 至少一个候选记录|
+|`N_XRES/N_VRES`|分别保存 32/256-bit 结果|
+|`N_MEMQ`|增加深度不增加活动表项数|
+|`N_RESULT[fu]`|必须覆盖在途不可停顿结果|
+|`G_tag/W_seq`|回绕前必须排空歧义|
+|`L_fu/II_fu`|延迟和启动间隔分别配置|
+|`W_AXI`|外部 AXI 数据宽度；必须支持 4 B 对齐窄事务|
+|DMA FIFO/ID|覆盖最多 4 个在途 burst|
 
-### 6.3. 尚待解决的规范问题
+### 12.3. 正确性不变量
 
-以下项目仍缺少可操作的接口或边界定义。前述章节保留了已经确立的约束。不得用标准 RVV 行为或常见实现惯例替代尚未决定的设计。
+1. 每条成功派发的动态指令恰有一个 ROB Entry。
+2. 全部显式和隐式源在目的 RAT 更新前绑定。
+3. Complete 不直接更新已提交 ARF、Matrix 状态或存储器。
+4. RAT 清除必须同时匹配 tag 和结果槽，不能破坏年轻映射。
+5. 结果槽在全部登记消费者捕获前不得复用。
+6. 返回响应必须验证完整 owner identity。
+7. 不可逆 Core 写必须在 ROB Head 授权。
+8. 同一时刻至多一个 MemQ 表项活动。
+9. 所有请求在接受前必须预留返回容量。
+10. 背压期间 tag/data/fault 必须保持稳定。
+11. Flush/reset 不能取消已经接受的 SRAM/AXI 事务。
+12. tag/seq 回绕前必须消除所有迟到响应歧义。
+13. 声明的已实现能力不得大于已完成 RTL 和验证的集合。
 
-|主题|已确立的背景与缺失定义|
+## 13. 当前 Scalar-only RTL
+
+当前 RTL 只实现 XJ-ISA 的 33 条 Scalar 指令，不包含 Vector、Matrix、Core DMA、外部 AXI Manager、cache、特权架构或分支预测器。
+
+### 13.1. 模块组织
+
+相对于 RTL 工程的 `src/main/scala`：
+
+|模块|职责|
 |---|---|
-|归约接口|第 2 节和 `xj-isa.md` 只定义了 `vfredsum/vfredmax` 的功能，未定义其形式、目的类型、初始值、精度或掩码规则；无法据此推断具体指令接口|
-|向量编码与存储器接口|第 2 节和 `xj-isa.md` 尚未定义 Vector 机器编码、向量加载/存储助记符、寻址方式或元素在存储器中的布局；通用存储器访问规则不能替代这些定义|
-|置换与移位边界|`vrgather.vv` 为可选功能。无符号索引和越界索引返回零只是 RVV 参考行为，尚未决定本 ISA 是否采用。越界滑动距离、有效移位量位数以及 `.vi` 编码范围仍未规定|
-|掩码细节|比较写入时目的低 8 位以外的内容、比较中被掩码关闭通道的准确行为，以及掩码位值到 `vmerge.vvm` 两个源的映射均未完整定义|
-|浮点边界|已规定固定 RNE，但非数（NaN）、无穷、次正规数、带符号零、除零、越界转换及异常报告行为仍不完整。`Vexp/Vrcp/Vrsqrt` 的形式、数据类型、误差界限和特殊值处理也未规定|
-|矩阵/DMA/配置字段|已列出任务参数和记录类别，但缺少完整命令编码、字段宽度及配置寄存器映射。矩阵固定使用 8×8 tile，但不足一个 tile 的边界数据如何填充或屏蔽，以及 INT32 累加溢出行为仍未规定|
-|数据地址预检查|标量 `LW/SW` 对齐、DTCM 寻址和主机突发错误在附录 B 与 `xj-isa.md` 中定义。Vector/Matrix/DMA 的多拍行为仍待确定|
-|故障处理流程|附录 B 定义了标量故障记录、排空/清理、确认和重启。尚未实现的向量/矩阵/DMA 引擎的故障处理仍待确定|
+|`xiangjiang/Parameters.scala`、`Bundle.scala`|参数、ROBTag、操作数和完成记录|
+|`xiangjiang/frontend/Frontend.scala`|同步 ITCM 请求、取指缓冲、屏障和重定向|
+|`xiangjiang/backend/decode/DecodeUnit.scala`|Scalar 严格译码|
+|`xiangjiang/backend/rename/RenameStage.scala`|X ARF、RAT、源捕获和旁路|
+|`xiangjiang/backend/issue/IssueUnit.scala`|ALU/Branch RS 和最老就绪发射|
+|`xiangjiang/backend/fu/FunctionalUnit.scala`|ALUUnit、BranchUnit|
+|`xiangjiang/backend/rob/Rob.scala`|ROB 和 Scalar Result Pool|
+|`xiangjiang/mem/LSU.scala`|有序 MemQ 和单活动访问|
+|`xiangjiang/mem/TCM.scala`|ITCM/DTCM|
+|`xiangjiang/ScalarCore.scala`|派发、CDB、提交和故障清理|
+|`device/*`|Host AXI/控制寄存器/存储器适配器|
+|`top/*`|平台集成和 RTL 生成|
 
-## 7. 参考资料
+### 13.2. 默认参数
 
-- [RISC-V V 规范](https://docs.riscv.org/reference/isa/unpriv/v-st-ext)：仅用于命名和功能对照，不声明兼容性。
-- [Ibex 文档](https://ibex-core.readthedocs.io/en/latest/index.html)。
-- [BOOM 文档](https://docs.boom-core.org/en/latest/index.html)。
+|参数|当前默认值|
+|---|---:|
+|ROB|8|
+|ALU/Branch RS|各 4|
+|Scalar Result Slot|6|
+|MemQ|4|
+|generation/seq|4/16 bit|
+|Host AXI address/data/ID|32/32/4 bit|
 
-## 附录 A. RTL 开发环境
+### 13.3. 构建与验证
 
-`XJ` conda 环境提供 Linux x86-64 RTL 工具链。在本工作站上，现代版 conda 安装于 `~/miniforge3`，`XJ` 安装于 `~/miniforge3/envs/XJ`；旧版 `~/anaconda` 安装仍予保留。Bash 会初始化现代版 conda，但不会自动激活环境。
-
-### A.1. 激活与使用
-
-在仓库根目录使用仓库启动器运行，无需激活 shell 环境：
-
-```bash
-./mill xj.compile
-./mill xj.test
-```
-
-`./mill` 通过 `conda run -n XJ` 运行 `XJ` 中安装的 Mill，并始终使用 `--no-server`。如果设置了 `CONDA_EXE`，则使用该变量；否则使用 `$HOME/miniforge3/bin/conda`。启动器只为其子进程选择工具链；直接运行 `mill` 仍取决于父 shell 的 `PATH`。如需交互式使用原生工具：
-
-```bash
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda activate XJ
-command -v verilator
-verilator --version
-```
-
-选中的 Verilator 应为 `$CONDA_PREFIX/bin/verilator`，版本 5.052。如果测试日志先显示 `/usr/bin/verilator`，随后出现 `%Error: Invalid Option: --build`，说明选中了保留的系统 Verilator 4.028；该版本无法编译 ChiselSim 测试框架。请运行 `./mill xj.test`，不要直接运行 `mill xj.test`；也不要为了绕过工具链错误而删除 `--build` 或修改 RTL。
-
-经验证，在取消设置 Conda 激活变量且 `PATH=/usr/bin:/bin` 的情况下，启动器仍可通过六个测试套件中的全部 30 项仿真，生成的仿真 Makefile 选择了 `~/miniforge3/envs/XJ/bin/verilator`。
-
-将 Chisel 源文件放在 `src/main/scala` 中。`build.mill` 中的 `xj` 模块固定 Scala、Chisel 库和匹配的编译器插件版本；Chisel 不是 Python 包。`.mill-jvm-opts` 提供项目根目录。Chisel 会自动解析与其匹配的 firtool；不要用无关的系统版本覆盖它。首次解析依赖项需要网络连接。
-
-使用 `gtkwave path/to/waveform.vcd` 查看仿真波形。GTKWave 需要图形显示环境；其原生窗口已在本工作站上通过 WSLg 验证。运行 `conda deactivate` 退出环境；激活/停用操作会切换和恢复 `JAVA_HOME`。
-
-### A.2. 已验证版本
-
-|组件|版本|
-|---|---|
-|Python|3.12.15|
-|OpenJDK|21.0.10-internal|
-|Mill|1.0.6，官方上游 JVM 发行版|
-|Scala|2.13.18|
-|Chisel 及编译器插件|7.16.0|
-|Chisel 管理的 firtool|1.160.0|
-|Verilator|5.052|
-|GTKWave|3.3.121|
-|GNU C++ 编译器|15.3.0|
-
-验证使用了一个临时的有符号 INT8 乘加电路：Chisel 生成 SystemVerilog，Verilator 编译并运行 C++ 仿真，GTKWave 显示生成的 VCD。检查覆盖复位、正负乘积、使能保持、一个 INT8 边界值及复位优先级。该临时电路及仿真文件不属于 NPU 实现。
-
-### A.3. 重建环境
-
-现代版 conda 可用时，在仓库根目录运行：
-
-```bash
-conda env create --file environment.yml
-conda activate XJ
-```
-
-`environment.yml` 从 conda-forge 安装原生工具。Mill 单独安装，因为已测试的 conda-forge `mill=1.0.6` 软件包错误地请求了未发布的 `SNAPSHOT` 依赖项。使用系统 `curl` 和 coreutils，将经过验证的[官方 Mill 1.0.6 构件](https://repo.maven.apache.org/maven2/com/lihaoyi/mill-dist/1.0.6/)安装到活动环境中：
-
-```bash
-(
-  set -eu
-  : "${CONDA_PREFIX:?Activate XJ first}"
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' EXIT
-  curl --fail --location --output "$tmp" \
-    https://repo.maven.apache.org/maven2/com/lihaoyi/mill-dist/1.0.6/mill-dist-1.0.6.exe
-  printf '%s  %s\n' \
-    b24c8777c4be9581b31fad821c16d60fbdaae22a27a765b06265f194a6146b08 \
-    "$tmp" | sha256sum --check
-  install -m 755 "$tmp" "$CONDA_PREFIX/bin/mill"
-)
-./mill xj.compile
-```
-
-`.exe` 文件名指的是上游跨平台 JVM 启动器，并非仅适用于 Windows 的二进制文件。Scala/Chisel 配置遵循[官方 Chisel 安装指南](https://www.chisel-lang.org/docs/installation)。
-
-## 附录 B. 已实现的纯标量平台
-
-`src/main/scala/top/XiangJiangNPU.scala` 实现了标量配置。其中不包含向量、矩阵、DMA、缓存、分支预测器、特权架构或外部存储器主接口。`xj-isa.md` 确定了 33 条 Scalar 指令及其编码；这是 RV32I 子集加机器字为 `0x0000000B` 的自定义 `HALT`，而不是完整的 RV32I 平台。
-
-### B.1. 模块组织与执行
-
-目录和包组织参考[香山的 Scala 源码布局](https://github.com/OpenXiangShan/XiangShan/tree/kunminghu-v3/src/main/scala)：`xiangjiang` 包含核心，`device` 包含面向主机的外设，`top` 包含平台集成和 RTL 生成。这只是组织结构上的参考，不会导入香山 RTL、Rocket Chip 或其推测执行模型。以下路径均相对于 `src/main/scala`。
-
-|目录 / 模块|职责|
-|---|---|
-|`xiangjiang/Parameters.scala`、`xiangjiang/Bundle.scala`|详细化参数、完整 ROB 标签、已捕获操作数、微操作和完成记录|
-|`xiangjiang/frontend/Frontend.scala`：`Frontend`|一个未完成的同步 ITCM 请求、一个取指缓冲区、屏障暂停和已提交重定向|
-|`xiangjiang/backend/decode/DecodeUnit.scala`：`DecodeUnit`|严格的指令合法性及源/目的元数据|
-|`xiangjiang/backend/rename/RenameStage.scala`：`RenameStage`|31 个有存储的架构寄存器、RAT、源版本捕获以及提交/CDB/结果旁路；x0 无存储|
-|`xiangjiang/backend/issue/IssueUnit.scala`：`IssueUnit`|独立的 ALU 和分支保留站、最老就绪优先发射以及完整标签唤醒；分支只能在 ROB 头部发射|
-|`xiangjiang/backend/fu/FunctionalUnit.scala`：`ALUUnit`、`BranchUnit`|整数执行和选定目标验证；带寄存器的结果缓冲区在背压时保留完成结果|
-|`xiangjiang/backend/rob/Rob.scala`：`Rob`|顺序退休、异常元数据和独立分配的标量结果池|
-|`xiangjiang/mem/LSU.scala`：`LSU`|有序 MemQ、独立的最老基址就绪地址调度器、已捕获存储数据和一个活动存储器操作|
-|`xiangjiang/mem/TCM.scala`：`InstructionTcm`、`DataTcm`|实际的同步单端口 ITCM 和四个独立的 512 位 1R1W DTCM 存储体|
-|`xiangjiang/ScalarCore.scala`：`ScalarCore`|原子派发、单一最老完成 CDB、统一提交、屏障处理和精确故障停机|
-|`device/AXI.scala`|AXI4/AXI4-Lite bundle；AXI4 接收 ID 宽度，而非核心参数|
-|`device/ControlRegisters.scala`、`device/MemorySubsystem.scala`|AXI4-Lite CSR 和 AXI4-Full 主机 SRAM 访问|
-|`top/XiangJiangNPU.scala`、`top/Generate.scala`|连接核心与主机设备；生成 RTL 和配置|
-
-核心源代码不导入 `device` 或 `top`。AXI bundle 独立于 `XJParams`；控制寄存器和存储器设备仍是湘江专用适配器，使用核心的状态、容量和 TCM 接口。TCM 组织保留在 `xiangjiang/mem` 中，因为其分组和访问规则属于 NPU 架构的一部分。
-
-派发和提交每周期均至多接收一条指令。S-ALU 和 S-AGU 独立调度；在较老指令因依赖阻塞时，就绪的较年轻 ALU 指令仍可执行。ALU/分支完成延迟为一个周期；当前一结果能够离开时，启动间隔为一。这并不表示单未完成请求前端能达到每周期一条指令。
-
-只有成功提交才会改变架构寄存器。每个源都会捕获重映射之前的生产者版本或值；存储数据绝不会从较年轻的寄存器版本中重新读取。无结果指令占用 ROB/队列记录，但不占用标量结果槽位。CDB 以原子方式更新 ROB 和所有唤醒消费者；陈旧或重复的完整 `{slot,generation}` 标签无法完成一条新指令。在某个时钟边沿释放的资源要到下一周期才可使用，不支持同周期分配旁路。
-
-代号和年龄计数器绝不会静默回绕：计数耗尽时停止分配，直到 ROB 为空且所有完成源均已排空，随后重新开始计数。故障清理会停止新发射，排空已接收的存储器流量和已缓冲结果，再丢弃尚未发射的保留项、RAT 表项和未提交的 ROB/结果。已排队但未发射的工作不属于未完成结果源。
-
-### B.2. 默认参数与 SRAM 寻址
-
-`XJParams` 是详细化时配置。`top.Generate` 将选定值写入 `generated/xiangjiang-config.json`；软件也可以通过 CSR 读取容量。
-
-|参数|默认值|
-|---|---|
-|ITCM 容量|256 KiB，固定|
-|DTCM 每存储体容量 / 总容量|256 KiB / 1 MiB，固定|
-|ROB 表项|8|
-|ALU / 分支保留表项|各 4 个|
-|标量结果槽位|6|
-|MemQ 表项|4|
-|代号 / 序号宽度|4 / 16 位|
-|AXI 地址 / 数据 / ID 宽度|32 / 32 / 4 位|
-
-核心指令空间和数据空间相互独立。核心 `LW/SW` 使用从零开始的 DTCM 地址；其中不得包含主机窗口基址。访问采用小端序，按 4 B 对齐，并在 SRAM 索引截断前进行范围检查。未对齐的 `LW/SW` 会触发故障，且不会发出存储器请求。
-
-|AXI4-Full 主机字节范围|目标|
-|---|---|
-|`[0x00000000, 0x00040000)`|ITCM|
-|`[0x10000000, 0x10100000)`|DTCM|
-|所有其他地址|`SLVERR`，无别名|
-
-对于从零开始的 20 位 DTCM 字节偏移 `a`，存储体为 `a[7:6]`，12 位行索引为 `a[19:8]`（等价于 `a >> 8`），512 位行内字节通道为 `a[5:0]`。每个 256 KiB bank 包含 4096 条 64 B 行。标量适配器每次访问一个 32 位字并使用字节写使能；物理存储体提供独立读写端口。主机/核心适配器仲裁端口冲突，包括同一行的读写冲突。复位不会初始化或擦除 SRAM 内容；主机必须加载将要读取的全部代码和数据。
-
-### B.3. AXI4-Full 主机约定
-
-存储器端口是从接口，与 AXI4-Lite 控制从接口相互独立。集成系统选择控制从接口的基地址；其局部 CSR 偏移不隐含任何全局控制地址。
-
-- AW/W/B 和 AR/R 通道相互独立；W 可以先于 AW。最多允许一个未完成写突发和一个未完成读突发。响应保留 ID，并在被接收前保持稳定。
-- 支持对齐的 1、2 和 4 字节传输拍。`INCR` 支持 1–256 拍，`FIXED` 支持 1–16 拍，`WRAP` 支持 2/4/8/16 拍。突发必须位于同一 4 KiB 页内，并且完全位于一个允许的 SRAM 窗口中。验证期间的地址计算保留溢出位。
-- 窄写入使用由地址选定的字节通道；在这些通道之外置位 WSTRB 属于错误。窄读取的非活动通道返回零。拒绝独占/锁定事务；忽略 cache/prot/qos 属性。
-- 在任何写入发生前检查地址、大小、突发类型、长度、边界和权限错误。无效突发仍会排空规定的传输拍并返回 `SLVERR`；读取错误返回零数据，并保持请求的响应数量和末拍标记。
-- 错误的 WLAST 或无效 WSTRB 会抑制出错拍及其后所有拍，并产生粘滞 `SLVERR`。此前的有效写入不会回滚。排空长度由 AWLEN 而非 WLAST 决定；主设备仍须提供全部 AWLEN+1 拍。
-- 核心忙碌时接收的主机存储器访问返回 `SLVERR`，且不会修改 SRAM。CSR 仍可读取。当任何主机存储器通道处于已缓冲、传输中、等待响应接收或正在提交新请求的状态时，启动请求会被拒绝。
-
-### B.4. AXI4-Lite 控制寄存器
-
-以下所有偏移均为局部 32 位偏移，并按 4 B 对齐。AW 和 W 可以按任意顺序独立到达。响应经过缓冲，并在背压时保持稳定。未知/未对齐访问以及对只读寄存器的写入返回 `SLVERR`。
-
-|偏移|名称|访问方式 / 值|
-|---|---|---|
-|`0x00`|CONTROL|写位 0：START；位 1：ACK。同时写入两者无效。读取返回零|
-|`0x04`|STATUS|读取：位 0 BUSY，位 1 DONE，位 2 FAULT|
-|`0x08`|FAULT_PC|发生故障的指令 PC|
-|`0x0C`|FAULT_INST|原始指令字；取指失败时为零|
-|`0x10`|FAULT_CAUSE|`xj-isa.md` 定义的局部故障码，而非特权 `mcause`|
-|`0x14`|FAULT_ADDR|故障地址；非法指令故障时为非法指令字|
-|`0x18`|ITCM_BYTES|ITCM 容量|
-|`0x1C`|DTCM_BYTES|DTCM 总容量|
-|`0x20`|CONFIG_ROB|ROB 表项数|
-|`0x24`|CONFIG_XRES|标量结果槽位数|
-|`0x28`|CONFIG_MEMQ|MemQ 表项数|
-|`0x2C`|CONFIG_ISSUE|每个发射单元的保留表项数|
-|`0x30`|VERSION|接口版本 1|
-|`0x100 + 4*n`|XREG[n]|已提交的 x0–x31，只读；x0 始终为零|
-
-CONTROL 遵守 WSTRB：仅当字节通道 0 启用时才解释 START/ACK；忽略其他数据位。START 要求 `!BUSY && !DONE && !FAULT`，并要求主机存储器接口完全空闲。ACK 要求 `!BUSY`，会清除终止状态/故障字段，但不清除寄存器或 SRAM。只有在 AW 和 W 都被捕获且权限检查通过后，成功的控制写入才会产生单周期脉冲。
-
-### B.5. 主机运行与故障恢复
-
-1. 复位核心；如果此前处于终止状态，则在 BUSY 变为零后执行 ACK。
-2. 通过 AXI4-Full 将程序加载到 ITCM 偏移零处，并初始化所需 DTCM 数据。在 START 前接收全部 B/R 响应。
-3. 写入 START。每次运行都从 PC 零开始；没有可编程入口 PC 寄存器。
-4. 轮询 STATUS。HALT 仅在更早工作和所有执行/存储器活动排空后提交，随后设置 DONE 并清除 BUSY。FENCE 排空更早工作，并从 PC+4 恢复执行。
-5. 发生 FAULT 时，先等待 BUSY 清零，再访问 SRAM 或确认故障。当异常到达 ROB 头部时，故障字段锁存；清理期间 BUSY 可能仍保持置位。已提交的较早状态会被保留，故障指令不提交，较年轻状态被丢弃。任何较年轻存储都不会获得 ROB 头部授权。
-6. 读取结果或故障字段，执行 ACK，可选择替换程序/数据，然后再次 START。成功 HALT 和故障恢复都会保留已提交寄存器及 SRAM；只有架构寄存器复位会清除 x1–x31。
-
-本平台没有指令级陷阱处理程序，也没有从故障处恢复执行的机制。重启是从 PC 零开始、保留已提交状态的一次新执行。标量存储会在其单字请求前完成检查；格式错误的主机多拍写入遵循第 B.3 节的部分副作用规则。
-
-### B.6. 构建与验证
-
-在仓库根目录使用支持 `XJ` 环境的启动器运行（无需提前激活 shell 环境）：
+在 RTL 仓库根目录：
 
 ```bash
 ./mill xj.test
 ./mill xj.runMain top.Generate generated
 ```
 
-生成器输出拆分的 SystemVerilog、验证层、`filelist.f` 和 `xiangjiang-config.json`。下游工具应在 **`generated/` 作为工作目录**的情况下使用 `filelist.f`，而不是只编译 `XiangJiangNPU.sv`；文件列表中的条目是相对于该目录的路径。
+当前已记录的验证结果为 6 个测试套件、30 项仿真通过，覆盖 Scalar 译码/ALU/分支、ROB/结果槽、重命名冒险、迟到标签、回绕排空、有序 LSU、DTCM bank、Host AXI、精确故障、ACK 和重启。该结果只证明 Scalar-only 实现，不证明目标 Vector/Matrix/DMA 已实现。
 
-包迁移后，`src/test/scala/xiangjiang` 中六个测试套件的全部 30 项硬件仿真均已通过。覆盖范围包括译码器/ALU/分支边界、ROB/结果容量、重命名冒险、陈旧标签和回绕排空、独立发射、有序存储器访问、AXI 通道/突发/保护、存储体并发、完整的主机加载程序、精确故障和重启。集成程序测试套件还覆盖了结果/发射/MemQ 资源均只有一个的情况。
+## 14. 参考资料
 
-迁移后的 `top.Generate` 入口生成了 RTL、验证层、文件列表和配置，其内容与重构前输出逐字节一致。独立 Verilator 运行使用 `filelist.f` 编译该输出，通过 AXI 加载求和程序，并得到 x2=x3=DTCM[64]=21，恰好有 24 次顺序提交以及 FENCE/HALT。一条未对齐存储在 PC=4 处触发故障，原因码为 6、地址为 66，且未改变较年轻寄存器或 SRAM。ACK 和重启保留了已提交状态，并产生 x5=DTCM[68]=22。临时冒烟测试驱动程序不属于本设计。
+- [XJ-ISA](xj-isa.md)
+- [RISC-V Unprivileged ISA](https://docs.riscv.org/reference/isa/unpriv/)
+- [RISC-V Vector Extension](https://docs.riscv.org/reference/isa/unpriv/v-st-ext)：仅用于命名和行为对照
+- [Ibex Documentation](https://ibex-core.readthedocs.io/en/latest/)
+- [BOOM Documentation](https://docs.boom-core.org/en/latest/)
