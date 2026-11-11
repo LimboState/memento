@@ -14,3 +14,12 @@
 
 
 
+**Reference:**
+1. [一生一芯](https://ysyx.oscc.cc/docs/)
+2. [riscv-mcu](https://github.com/renyangang/riscv-mcu)
+3. [LeetCUDA: CUDA Kernel 优化之路](https://leetcuda.readthedocs.io/en/latest/index.html)
+4. [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch)
+5. [Agent Learning Hub](https://github.com/datawhalechina/Agent-Learning-Hub)
+
+
+
