@@ -71,4 +71,7 @@ NCU 的 Occupancy section 会明确指出 `launch__occupancy_limit_registers` / 
 
 >255 墙
 
+`launch__registers_per_thread` 给出每线程寄存器数，硬上限 255（每线程）。超限时编译器把变量溢出到 local memory（SASS 里表现为 `LDL`/`STL` 指令，NCU 里看 `l1tex__t_bytes_pipe_lsu_mem_local_op__ld/st.sum` 是否非零）。编译期排查用 `--ptxas-options=-v` 与 `cuobjdump --dump-resource-usage` 的 STACK 字节。两个实战要点：
 
+- spill 的代价主要不是流量。一个 fp4 attention kernel 在 D=512 时 spill 总量 234MB，但 local 流量仅 12.8GB/s，带宽不是瓶颈；真正的代价是 **延迟暴露**：8 warps/SM 意味着每 scheduler 只有 2 个 warp 可切换， LDL 的几百 cycle 延迟藏不住，同时指令数也变多。
+- 寄存器预算可以算出来。attention 的 O 累加器每线程占 $k_{B_r} \cdot D / 256$ 个 f32 寄存器（M8N1 布局，$256 = 32 \; lanes \times 8$ 个 warp，对应 consumer 全部 256 线程）；$k_{B_r} = 128$ 时为 $D/2$，D=512 要 256 个，超出 255 寄存器上限。大 D 必须换 M4N2 atom（列拆给两个 warp，每线程 $D/4$) 的数学来源就在这里。
