@@ -46,5 +46,5 @@ To set the voltage level of the SDA or SCL line, the NMOS is set on or off.
 + When the NMOS is on, the device pulls current through the resistor to ground. This pulls the open-drain line **low**. **A fast transition**, Figure 2-2.
 + When the NMOS turns off, the device stops pulling current, and the pullup resistor pulls the SDA or SCL line to VDD. The pullup resistor pulls the line **high**. **A slower transition**, Figure 2-3.
 
-![[Pasted image 20261110214640.png|597]]
+![[Pasted image 20261111233902.png|593]]
 
