@@ -12,14 +12,20 @@
 
 
 
+**TODAY: 一些模拟器(软件)**
++ vortex 从软件仿真到硬件RTL实现，支持RISC-V指令。[github.com/vortex](https://github.com/vortexgpgpu/vortex/tree/master)
++ [GPGPU-Sim](https://gpgpu-sim.org/manual/index.php/Main_Page?utm_source=openai#Introduction) 为了设计更好的处理器，我们需要学习一些优秀的设计，GPGPU中重点学习GPU的一些设计哲学。[github.com/gpgpu-sim](https://github.com/gpgpu-sim/gpgpu-sim_distribution)
++ gem5，不必多言。
+
 
 
 **Reference:**
 1. [一生一芯](https://ysyx.oscc.cc/docs/)
-2. [riscv-mcu](https://github.com/renyangang/riscv-mcu)
-3. [LeetCUDA: CUDA Kernel 优化之路](https://leetcuda.readthedocs.io/en/latest/index.html)
-4. [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch)
-5. [Agent Learning Hub](https://github.com/datawhalechina/Agent-Learning-Hub)
+2. [NJU-PA Lab](https://nju-projectn.github.io/ics-pa-gitbook/ics2026/)
+3. [riscv-mcu](https://github.com/renyangang/riscv-mcu)
+4. [LeetCUDA: CUDA Kernel 优化之路](https://leetcuda.readthedocs.io/en/latest/index.html)
+5. [Build a Large Language Model (From Scratch)](https://github.com/rasbt/LLMs-from-scratch)
+6. [Agent Learning Hub](https://github.com/datawhalechina/Agent-Learning-Hub)
 
 
 
